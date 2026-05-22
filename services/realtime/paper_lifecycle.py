@@ -326,10 +326,6 @@ def _decision_candle_timestamp(decision: dict) -> int:
     )
 
 
-def _build_duplicate_key(candle_timestamp: int, pattern: str, direction: str, timeframe: str) -> str:
-    return f"{candle_timestamp}|{pattern}|{direction}|{timeframe}"
-
-
 def _extract_context(trade: dict) -> dict:
     context = trade.get("context_json")
     if isinstance(context, dict):
@@ -388,36 +384,17 @@ class PaperLifecycle:
         pattern = str(decision.get("pattern", ""))
         direction = str(decision.get("direction", ""))
         timeframe = str(decision.get("timeframe", "1m"))
-        candle_timestamp = _decision_candle_timestamp(decision)
-        duplicate_key = _build_duplicate_key(candle_timestamp, pattern, direction, timeframe)
-        cooldown_window = TIMEFRAME_SECONDS.get(timeframe, 60) * 1000
-        now_ms = int(time.time() * 1000)
 
-        for trade in open_trades:
-            trade_context = _extract_context(trade)
-            trade_candle_timestamp = _coerce_int(
-                trade.get("candle_timestamp") or trade_context.get("candle_timestamp") or trade.get("opened_at_epoch")
-            )
-            trade_key = _build_duplicate_key(
-                trade_candle_timestamp,
-                str(trade.get("pattern", "")),
-                str(trade.get("direction", "")),
-                str(trade.get("timeframe", "1m")),
-            )
-            if trade_key == duplicate_key:
-                return "DUPLICATE_SAME_CANDLE"
-
-        matching_trades = [
-            trade for trade in open_trades
-            if str(trade.get("pattern", "")) == pattern
-            and str(trade.get("direction", "")) == direction
-            and str(trade.get("timeframe", "1m")) == timeframe
-        ]
-        if matching_trades:
-            last_opened_epoch = max(_coerce_int(trade.get("opened_at_epoch")) for trade in matching_trades)
-            elapsed = now_ms - last_opened_epoch
-            if elapsed < cooldown_window:
-                return "COOLDOWN_ACTIVE"
+        conn = sqlite3.connect(str(config.PAPER_TRADES_DB))
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM open_trades WHERE pattern=? AND direction=? AND timeframe=?",
+            (pattern, direction, timeframe),
+        )
+        duplicate_count = _coerce_int(cur.fetchone()[0])
+        conn.close()
+        if duplicate_count > 0:
+            return "DUPLICATE_OPEN_TRADE"
 
         return None
 

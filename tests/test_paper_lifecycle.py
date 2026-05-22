@@ -380,7 +380,7 @@ def test_open_trade_persists_trade_dna_fields():
             assert open_trade["lineage_chain"] == decision["lineage_chain"]
 
 
-def test_blocks_duplicate_same_candle_same_timeframe():
+def test_blocks_duplicate_open_trade_same_pattern_direction_timeframe():
     with tempfile.TemporaryDirectory() as tmp:
         db_path = _setup_temp_db(tmp)
         with patch.object(config, "PAPER_TRADES_DB", db_path):
@@ -410,7 +410,7 @@ def test_blocks_duplicate_same_candle_same_timeframe():
             assert _get_open_count(db_path) == 1
 
 
-def test_blocks_same_pattern_direction_timeframe_during_cooldown():
+def test_blocks_same_pattern_direction_timeframe_even_with_new_timestamp():
     with tempfile.TemporaryDirectory() as tmp:
         db_path = _setup_temp_db(tmp)
         with patch.object(config, "PAPER_TRADES_DB", db_path):
@@ -444,7 +444,7 @@ def test_blocks_same_pattern_direction_timeframe_during_cooldown():
             assert _get_open_count(db_path) == 1
 
 
-def test_allows_same_pattern_on_new_candle_after_cooldown():
+def test_allows_same_pattern_when_direction_differs():
     with tempfile.TemporaryDirectory() as tmp:
         db_path = _setup_temp_db(tmp)
         with patch.object(config, "PAPER_TRADES_DB", db_path):
@@ -469,13 +469,12 @@ def test_allows_same_pattern_on_new_candle_after_cooldown():
             second_decision = {
                 **first_decision,
                 "timestamp_ms": now_ms,
+                "direction": "SHORT",
             }
 
             first_trade = pl._open_trade(first_decision, [])
             assert first_trade is not None
-            existing = _get_open_trades(db_path)
-            existing[0]["opened_at_epoch"] = now_ms - 400000
-            second_trade = pl._open_trade(second_decision, existing)
+            second_trade = pl._open_trade(second_decision, _get_open_trades(db_path))
             assert second_trade is not None
 
 
