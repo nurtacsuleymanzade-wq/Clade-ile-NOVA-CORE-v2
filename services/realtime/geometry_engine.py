@@ -127,6 +127,35 @@ def _fallback_tp(entry: float, sl: float, direction: str) -> tuple[float, float]
     return tp1, tp2
 
 
+def _fallback_sl(entry: float, direction: str) -> float:
+    distance = entry * 0.003
+    if direction == "LONG":
+        return entry - distance
+    return entry + distance
+
+
+def _normalize_sl(entry: float, sl: float | None, direction: str) -> tuple[float, float]:
+    minimum_risk = entry * 0.002
+    if sl is None:
+        sl = _fallback_sl(entry, direction)
+    if direction == "LONG":
+        raw_risk = entry - sl
+        risk = max(raw_risk, minimum_risk)
+        return entry - risk, risk
+    raw_risk = sl - entry
+    risk = max(raw_risk, minimum_risk)
+    return entry + risk, risk
+
+
+def _candle_extreme(candle_dna: dict | None, key: str) -> float | None:
+    if not candle_dna:
+        return None
+    value = candle_dna.get(key)
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
 def _build_generic_geometry(
     pattern_name: str,
     direction: str,
@@ -134,6 +163,7 @@ def _build_generic_geometry(
     current_price: float,
     zone_list: list[dict],
     pattern_reason: str,
+    candle_dna: dict | None = None,
 ) -> dict | None:
     highs = _zone_prices(zone_list, ("equal_highs", "swing_high"))
     lows = _zone_prices(zone_list, ("equal_lows", "swing_low"))
@@ -143,9 +173,8 @@ def _build_generic_geometry(
     if direction == "LONG":
         sl_anchor = _nearest_below(lows, entry) or (min(lows) if lows else None)
         tp1 = _nearest_above(highs, entry)
-        if sl_anchor is None:
-            return None
-        sl = sl_anchor - buffer
+        sl = (sl_anchor - buffer) if sl_anchor is not None else _candle_extreme(candle_dna, "low")
+        sl, risk = _normalize_sl(entry, sl, direction)
         if tp1 is None:
             tp1, tp2 = _fallback_tp(entry, sl, direction)
         else:
@@ -155,9 +184,8 @@ def _build_generic_geometry(
     else:
         sl_anchor = _nearest_above(highs, entry) or (max(highs) if highs else None)
         tp1 = _nearest_below(lows, entry)
-        if sl_anchor is None:
-            return None
-        sl = sl_anchor + buffer
+        sl = (sl_anchor + buffer) if sl_anchor is not None else _candle_extreme(candle_dna, "high")
+        sl, risk = _normalize_sl(entry, sl, direction)
         if tp1 is None:
             tp1, tp2 = _fallback_tp(entry, sl, direction)
         else:
@@ -165,7 +193,6 @@ def _build_generic_geometry(
         if tp2 is None:
             tp2 = tp1 - max(buffer, abs(entry - tp1) * 0.5)
 
-    risk = abs(entry - sl)
     reward = abs(tp1 - entry)
     if risk <= 0 or reward <= 0:
         return None
@@ -194,8 +221,9 @@ def _build_generic_geometry(
         "analysis": {
             "logic_key": "DEFAULT",
             "entry_source": "current_price",
-            "sl_anchor": round(sl_anchor, 2),
+            "sl_anchor": round(sl_anchor, 2) if sl_anchor is not None else None,
             "tp1_anchor": round(tp1, 2),
+            "minimum_risk_applied": round(entry * 0.002, 2),
         },
     }
 
@@ -204,6 +232,7 @@ def _compute_geometry(
     pattern: dict,
     zones: dict | None,
     current_price: float | None,
+    candle_dna: dict | None = None,
 ) -> dict | None:
     pattern_name = pattern.get("pattern", "NONE")
     direction = pattern.get("direction", "NEUTRAL")
@@ -239,11 +268,10 @@ def _compute_geometry(
 
     if logic_key == "STOP_HUNT_RECLAIM_LONG":
         sweep_low = _nearest_below(equal_lows + swing_lows, current_price) or (min(equal_lows + swing_lows) if (equal_lows or swing_lows) else None)
-        if sweep_low is None or current_price <= sweep_low:
-            return None
-        entry = sweep_low + (buffer * 2)
+        entry = sweep_low + (buffer * 2) if sweep_low is not None and current_price > sweep_low else current_price
         tp1 = _nearest_above(equal_highs, entry) or _nearest_above(swing_highs, entry)
-        sl = sweep_low - buffer
+        sl = (sweep_low - buffer) if sweep_low is not None else _fallback_sl(entry, direction)
+        sl, risk = _normalize_sl(entry, sl, direction)
         if tp1 is None:
             tp1, tp2 = _fallback_tp(entry, sl, direction)
             tp_reason = "fallback_rr_target"
@@ -253,15 +281,14 @@ def _compute_geometry(
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
         tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"sweep_low": round(sweep_low, 2), "target_liquidity": round(tp1, 2)})
+        analysis.update({"sweep_low": round(sweep_low, 2) if sweep_low is not None else None, "target_liquidity": round(tp1, 2)})
         pattern_name = logic_key
     elif logic_key == "STOP_HUNT_RECLAIM_SHORT":
         sweep_high = _nearest_above(equal_highs + swing_highs, current_price) or (max(equal_highs + swing_highs) if (equal_highs or swing_highs) else None)
-        if sweep_high is None or current_price >= sweep_high:
-            return None
-        entry = sweep_high - (buffer * 2)
+        entry = sweep_high - (buffer * 2) if sweep_high is not None and current_price < sweep_high else current_price
         tp1 = _nearest_below(equal_lows, entry) or _nearest_below(swing_lows, entry)
-        sl = sweep_high + buffer
+        sl = (sweep_high + buffer) if sweep_high is not None else _fallback_sl(entry, direction)
+        sl, risk = _normalize_sl(entry, sl, direction)
         if tp1 is None:
             tp1, tp2 = _fallback_tp(entry, sl, direction)
             tp_reason = "fallback_rr_target"
@@ -271,15 +298,14 @@ def _compute_geometry(
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
         tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"sweep_high": round(sweep_high, 2), "target_liquidity": round(tp1, 2)})
+        analysis.update({"sweep_high": round(sweep_high, 2) if sweep_high is not None else None, "target_liquidity": round(tp1, 2)})
         pattern_name = logic_key
     elif logic_key == "CONTINUATION_LONG":
         pullback_low = _nearest_below(swing_lows + equal_lows, current_price)
         tp1 = _nearest_above(swing_highs, current_price) or _nearest_above(equal_highs, current_price)
-        if pullback_low is None:
-            return None
         entry = current_price
-        sl = pullback_low - buffer
+        sl = (pullback_low - buffer) if pullback_low is not None else _fallback_sl(entry, direction)
+        sl, risk = _normalize_sl(entry, sl, direction)
         if tp1 is None:
             tp1, tp2 = _fallback_tp(entry, sl, direction)
             tp_reason = "fallback_rr_target"
@@ -289,15 +315,14 @@ def _compute_geometry(
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
         tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"pullback_low": round(pullback_low, 2), "trend_target": round(tp1, 2)})
+        analysis.update({"pullback_low": round(pullback_low, 2) if pullback_low is not None else None, "trend_target": round(tp1, 2)})
         pattern_name = logic_key
     elif logic_key == "CONTINUATION_SHORT":
         pullback_high = _nearest_above(swing_highs + equal_highs, current_price)
         tp1 = _nearest_below(swing_lows, current_price) or _nearest_below(equal_lows, current_price)
-        if pullback_high is None:
-            return None
         entry = current_price
-        sl = pullback_high + buffer
+        sl = (pullback_high + buffer) if pullback_high is not None else _fallback_sl(entry, direction)
+        sl, risk = _normalize_sl(entry, sl, direction)
         if tp1 is None:
             tp1, tp2 = _fallback_tp(entry, sl, direction)
             tp_reason = "fallback_rr_target"
@@ -307,15 +332,14 @@ def _compute_geometry(
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
         tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"pullback_high": round(pullback_high, 2), "trend_target": round(tp1, 2)})
+        analysis.update({"pullback_high": round(pullback_high, 2) if pullback_high is not None else None, "trend_target": round(tp1, 2)})
         pattern_name = logic_key
     elif logic_key == "ABSORPTION_REVERSAL_LONG":
         absorption_low = _nearest_below(equal_lows + swing_lows, current_price)
-        if absorption_low is None or current_price <= absorption_low:
-            return None
-        entry = absorption_low + (buffer * 2)
+        entry = absorption_low + (buffer * 2) if absorption_low is not None and current_price > absorption_low else current_price
         tp1 = _nearest_above(equal_highs + swing_highs, entry)
-        sl = absorption_low - buffer
+        sl = (absorption_low - buffer) if absorption_low is not None else _fallback_sl(entry, direction)
+        sl, risk = _normalize_sl(entry, sl, direction)
         if tp1 is None:
             tp1, tp2 = _fallback_tp(entry, sl, direction)
             tp_reason = "fallback_rr_target"
@@ -325,15 +349,14 @@ def _compute_geometry(
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
         tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"absorption_low": round(absorption_low, 2), "resistance_target": round(tp1, 2)})
+        analysis.update({"absorption_low": round(absorption_low, 2) if absorption_low is not None else None, "resistance_target": round(tp1, 2)})
         pattern_name = logic_key
     elif logic_key == "ABSORPTION_REVERSAL_SHORT":
         absorption_high = _nearest_above(equal_highs + swing_highs, current_price)
-        if absorption_high is None or current_price >= absorption_high:
-            return None
-        entry = absorption_high - (buffer * 2)
+        entry = absorption_high - (buffer * 2) if absorption_high is not None and current_price < absorption_high else current_price
         tp1 = _nearest_below(equal_lows + swing_lows, entry)
-        sl = absorption_high + buffer
+        sl = (absorption_high + buffer) if absorption_high is not None else _fallback_sl(entry, direction)
+        sl, risk = _normalize_sl(entry, sl, direction)
         if tp1 is None:
             tp1, tp2 = _fallback_tp(entry, sl, direction)
             tp_reason = "fallback_rr_target"
@@ -343,10 +366,37 @@ def _compute_geometry(
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
         tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"absorption_high": round(absorption_high, 2), "support_target": round(tp1, 2)})
+        analysis.update({"absorption_high": round(absorption_high, 2) if absorption_high is not None else None, "support_target": round(tp1, 2)})
         pattern_name = logic_key
+    elif pattern_name in {"TRAP", "REVERSAL"}:
+        entry = current_price
+        candle_low = _candle_extreme(candle_dna, "low")
+        candle_high = _candle_extreme(candle_dna, "high")
+        if direction == "LONG":
+            sl = candle_low - buffer if candle_low is not None else _fallback_sl(entry, direction)
+            tp1 = _nearest_above(equal_highs + swing_highs, entry)
+        else:
+            sl = candle_high + buffer if candle_high is not None else _fallback_sl(entry, direction)
+            tp1 = _nearest_below(equal_lows + swing_lows, entry)
+        sl, risk = _normalize_sl(entry, sl, direction)
+        if tp1 is None:
+            tp1, tp2 = _fallback_tp(entry, sl, direction)
+            tp_reason = "fallback_rr_target"
+            analysis.update({"fallback_tp": True})
+        else:
+            tp2 = (
+                _nearest_above(equal_highs + swing_highs, tp1) or (tp1 + abs(tp1 - entry))
+                if direction == "LONG"
+                else _nearest_below(equal_lows + swing_lows, tp1) or (tp1 - abs(entry - tp1))
+            )
+        sl_reason = "candle_low_invalidation" if direction == "LONG" else "candle_high_invalidation"
+        analysis.update({
+            "candle_low": round(candle_low, 2) if candle_low is not None else None,
+            "candle_high": round(candle_high, 2) if candle_high is not None else None,
+            "target_liquidity": round(tp1, 2),
+        })
     else:
-        geometry = _build_generic_geometry(pattern_name, direction, timeframe, current_price, zone_list, pattern_reason)
+        geometry = _build_generic_geometry(pattern_name, direction, timeframe, current_price, zone_list, pattern_reason, candle_dna)
         if geometry is None:
             return None
         geometry["confidence"] = round(confidence, 4)
@@ -355,7 +405,6 @@ def _compute_geometry(
     if entry is None or sl is None or tp1 is None or tp2 is None:
         return None
 
-    risk = abs(entry - sl)
     reward = abs(tp1 - entry)
     if risk <= 0 or reward <= 0:
         return None
@@ -392,9 +441,10 @@ async def run_geometry_engine() -> None:
         try:
             pattern = _load_json(config.PATTERN_FILE) or {}
             zones = _load_json(config.ZONES_FILE)
+            candle_dna = _load_json(config.CANDLE_DNA_STATE_FILE)
             current_price = _get_current_price(zones)
 
-            geometry = _compute_geometry(pattern, zones, current_price)
+            geometry = _compute_geometry(pattern, zones, current_price, candle_dna)
 
             now_ms = int(time.time() * 1000)
             output = geometry if geometry else {
@@ -425,9 +475,9 @@ async def run_geometry_engine() -> None:
         await asyncio.sleep(2)
 
 
-def compute_geometry_from_data(pattern, zones, current_price):
+def compute_geometry_from_data(pattern, zones, current_price, candle_dna=None):
     """Public API for testing."""
-    return _compute_geometry(pattern, zones, current_price)
+    return _compute_geometry(pattern, zones, current_price, candle_dna)
 
 
 if __name__ == "__main__":
