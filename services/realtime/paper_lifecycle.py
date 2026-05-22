@@ -314,6 +314,9 @@ def _close_trade_in_db(
         return None
 
     trade = _normalize_open_trade(dict(row))
+    mae, mfe = _calculate_mae_mfe(trade, exit_price)
+    trade["mae"] = mae
+    trade["mfe"] = mfe
     duration_seconds = max(0, (closed_at_epoch - trade["opened_at_epoch"]) // 1000)
     closed_record = _normalize_closed_trade({
         **trade,
@@ -324,6 +327,8 @@ def _close_trade_in_db(
         "r_multiple": round(r_multiple, 4),
         "duration_seconds": duration_seconds,
         "close_reason": close_reason or _default_close_reason(result),
+        "mae": mae,
+        "mfe": mfe,
     })
 
     columns = ", ".join(CLOSED_TRADE_COLUMNS)
@@ -344,6 +349,23 @@ def _append_closed_trade(closed_trade: dict) -> None:
         f.write(line)
 
 
+def _calculate_mae_mfe(trade: dict, current_price: float) -> tuple[float, float]:
+    entry = _coerce_float(trade.get("entry"))
+    if entry <= 0:
+        return max(0.0, _coerce_float(trade.get("mae"))), max(0.0, _coerce_float(trade.get("mfe")))
+
+    direction = str(trade.get("direction", ""))
+    current_mae = max(0.0, _coerce_float(trade.get("mae")))
+    current_mfe = max(0.0, _coerce_float(trade.get("mfe")))
+    if direction == "LONG":
+        mae = max(current_mae, entry - current_price)
+        mfe = max(current_mfe, current_price - entry)
+    else:
+        mae = max(current_mae, current_price - entry)
+        mfe = max(current_mfe, entry - current_price)
+    return max(0.0, mae), max(0.0, mfe)
+
+
 def _update_open_trade_mae_mfe(db_path: Path, trade_id: str, mae: float, mfe: float) -> None:
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
@@ -357,18 +379,9 @@ def _update_open_trade_mae_mfe(db_path: Path, trade_id: str, mae: float, mfe: fl
 
 def _refresh_trade_excursions(db_path: Path, trades: list[dict], current_price: float) -> None:
     for trade in trades:
-        entry = _coerce_float(trade.get("entry"))
-        if entry <= 0:
+        if _coerce_float(trade.get("entry")) <= 0:
             continue
-        direction = str(trade.get("direction", ""))
-        current_mae = max(0.0, _coerce_float(trade.get("mae")))
-        current_mfe = max(0.0, _coerce_float(trade.get("mfe")))
-        if direction == "LONG":
-            mae = max(current_mae, entry - current_price)
-            mfe = max(current_mfe, current_price - entry)
-        else:
-            mae = max(current_mae, current_price - entry)
-            mfe = max(current_mfe, entry - current_price)
+        mae, mfe = _calculate_mae_mfe(trade, current_price)
         _update_open_trade_mae_mfe(db_path, str(trade.get("id", "")), mae, mfe)
 
 

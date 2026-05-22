@@ -103,3 +103,38 @@ def test_blocks_suppressed_combination_by_combo_key():
     decision = _make_decision(geometry, trend, regime, suppressed_state, {"score": 4.0}, {"event_type": "PRESSURE_BUILDING_LONG"}, {"cvd": 2.0, "body_ratio": 0.4})
     assert decision["decision"] == "BLOCKED"
     assert decision["reason"] == "SUPPRESSED_COMBINATION"
+
+
+def test_blocks_suppressed_combination_by_summary_when_trend_key_differs():
+    geometry = {
+        "pattern": "STOP_HUNT_RECLAIM_LONG",
+        "direction": "LONG",
+        "timeframe": "1m",
+        "session": "OFF_SESSION",
+        "entry": 50000.0,
+        "sl": 49850.0,
+        "tp1": 50300.0,
+        "tp2": 50600.0,
+        "rr": 2.0,
+        "confidence": 0.75,
+    }
+    trend = {"trend": "TREND_DOWN", "swing_highs_count": 4, "swing_lows_count": 3}
+    regime = {"regime": "COMPRESSION", "atr": 12.0, "delta_consistency": 0.8}
+    suppressed_state = {
+        "suppressed": [
+            {
+                "combo_key": "STOP_HUNT_RECLAIM_LONG|1m|OFF_SESSION|NO_TREND",
+                "pattern": "STOP_HUNT_RECLAIM_LONG",
+                "timeframe": "1m",
+                "session": "OFF_SESSION",
+                "trend": "NO_TREND",
+                "regime": "COMPRESSION",
+                "summary_key": "STOP_HUNT_RECLAIM_LONG|OFF_SESSION|COMPRESSION",
+                "status": "SUPPRESSED",
+            }
+        ],
+    }
+
+    decision = _make_decision(geometry, trend, regime, suppressed_state, {"score": 4.0}, {"event_type": "PRESSURE_BUILDING_LONG"}, {"cvd": 2.0, "body_ratio": 0.4})
+    assert decision["decision"] == "BLOCKED"
+    assert decision["reason"] == "SUPPRESSED_COMBINATION"

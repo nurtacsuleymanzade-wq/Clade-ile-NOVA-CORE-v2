@@ -498,7 +498,15 @@ def test_close_trade_carries_mae_mfe_into_closed_trades():
 
             assert closed_trade is not None
             assert closed_trade["mae"] == 4.0
-            assert closed_trade["mfe"] == 7.5
+            assert closed_trade["mfe"] == 10.0
+
+            conn = sqlite3.connect(str(db_path))
+            cur = conn.cursor()
+            cur.execute("SELECT mae, mfe FROM closed_trades WHERE id=?", ("close01",))
+            mae, mfe = cur.fetchone()
+            conn.close()
+            assert mae == 4.0
+            assert mfe == 10.0
 
 
 def test_blocks_duplicate_open_trade_same_pattern_direction_timeframe():

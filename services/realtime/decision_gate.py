@@ -253,6 +253,23 @@ def _suppressed_combo_keys(suppressed_state: dict) -> set[str]:
     return suppressed_keys
 
 
+def _suppressed_summary_keys(suppressed_state: dict) -> set[str]:
+    summary_keys: set[str] = set()
+    for item in suppressed_state.get("suppressed", []):
+        if item.get("status") != "SUPPRESSED":
+            continue
+        summary_key = item.get("summary_key")
+        if summary_key:
+            summary_keys.add(str(summary_key))
+    for item in (suppressed_state.get("combinations") or {}).values():
+        if item.get("status") != "SUPPRESSED":
+            continue
+        summary_key = item.get("summary_key")
+        if summary_key:
+            summary_keys.add(str(summary_key))
+    return summary_keys
+
+
 def _find_suppressed_entry(
     suppressed_state: dict,
     combo_key: str,
@@ -269,7 +286,7 @@ def _find_suppressed_entry(
     for item in suppressed_state.get("suppressed", []):
         if item.get("combo_key") == combo_key:
             return item
-        if item.get("summary_key") == summary_key and item.get("trend") == trend:
+        if item.get("summary_key") == summary_key and item.get("status") == "SUPPRESSED":
             return item
         if item.get("pattern") == pattern and item.get("trend") == trend and item.get("status") == "SUPPRESSED":
             return item
@@ -343,6 +360,7 @@ def _make_decision(
     timeframe = str(geometry.get("timeframe", "1m"))
     session = str(geometry.get("session") or _utc_session(now_ms))
     combo_key = f"{pattern}|{timeframe}|{session}|{trend_dir}"
+    summary_key = f"{pattern}|{session}|{regime_type}"
     decision.update({
         "timeframe": timeframe,
         "session": session,
@@ -371,7 +389,9 @@ def _make_decision(
         return decision
 
     suppressed_keys = _suppressed_combo_keys(suppressed_state)
-    if combo_key in suppressed_keys:
+    suppressed_summaries = _suppressed_summary_keys(suppressed_state)
+    if combo_key in suppressed_keys or summary_key in suppressed_summaries:
+        logger.info("SUPPRESSED_COMBINATION combo_key=%s summary_key=%s", combo_key, summary_key)
         decision.update({
             "decision": "BLOCKED",
             "reason": "SUPPRESSED_COMBINATION",
@@ -389,6 +409,7 @@ def _make_decision(
             regime_type,
         )
         if suppressed_entry:
+            logger.info("SUPPRESSED_COMBINATION combo_key=%s summary_key=%s", combo_key, summary_key)
             decision.update({
                 "decision": "BLOCKED",
                 "reason": "SUPPRESSED_COMBINATION",
