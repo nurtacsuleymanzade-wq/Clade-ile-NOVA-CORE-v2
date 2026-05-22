@@ -8,6 +8,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -20,6 +21,51 @@ logger = logging.getLogger(__name__)
 
 BOOK_TICKER_URL = f"{config.BINANCE_REST}/api/v3/ticker/bookTicker?symbol={config.SYMBOL}"
 TIMEOUT_SECONDS = config.TRADE_TIMEOUT_HOURS * 3600
+WIN_RESULTS = {"TP1_HIT", "TP2_HIT"}
+
+OPEN_TRADE_SCHEMA = [
+    ("id", "TEXT PRIMARY KEY", "''"),
+    ("pattern", "TEXT", "''"),
+    ("timeframe", "TEXT", "''"),
+    ("direction", "TEXT", "''"),
+    ("entry", "REAL", "0"),
+    ("sl", "REAL", "0"),
+    ("tp1", "REAL", "0"),
+    ("tp2", "REAL", "0"),
+    ("rr", "REAL", "0"),
+    ("confidence", "REAL", "0"),
+    ("context_adjusted_confidence", "REAL", "0"),
+    ("observer_score", "REAL", "0"),
+    ("delta_at_entry", "REAL", "0"),
+    ("imbalance_at_entry", "REAL", "0"),
+    ("cvd_at_entry", "REAL", "0"),
+    ("body_ratio", "REAL", "0"),
+    ("micro_event", "TEXT", "''"),
+    ("pattern_reason", "TEXT", "''"),
+    ("entry_reason", "TEXT", "''"),
+    ("sl_reason", "TEXT", "''"),
+    ("tp_reason", "TEXT", "''"),
+    ("session", "TEXT", "''"),
+    ("trend_at_entry", "TEXT", "''"),
+    ("regime_at_entry", "TEXT", "''"),
+    ("opened_at", "TEXT", "''"),
+    ("opened_at_epoch", "INTEGER", "0"),
+    ("context_json", "TEXT", "'{}'"),
+]
+
+CLOSED_EXTRA_SCHEMA = [
+    ("closed_at", "TEXT", "''"),
+    ("closed_at_epoch", "INTEGER", "0"),
+    ("result", "TEXT", "''"),
+    ("exit_price", "REAL", "0"),
+    ("r_multiple", "REAL", "0"),
+    ("R", "REAL", "0"),
+    ("duration_seconds", "INTEGER", "0"),
+    ("close_reason", "TEXT", "''"),
+]
+
+OPEN_TRADE_COLUMNS = [name for name, _, _ in OPEN_TRADE_SCHEMA]
+CLOSED_TRADE_COLUMNS = OPEN_TRADE_COLUMNS + [name for name, _, _ in CLOSED_EXTRA_SCHEMA]
 
 
 def _load_json(path: Path) -> dict | None:
@@ -31,118 +77,236 @@ def _load_json(path: Path) -> dict | None:
         return None
 
 
+def _utc_iso_from_ms(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ms_from_utc_iso(timestamp_text: str | int | float | None) -> int:
+    if not timestamp_text:
+        return 0
+    if isinstance(timestamp_text, (int, float)):
+        return int(timestamp_text)
+    try:
+        parsed = datetime.fromisoformat(str(timestamp_text).replace("Z", "+00:00"))
+        return int(parsed.timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def _coerce_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return int(default)
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _default_close_reason(result: str) -> str:
+    mapping = {
+        "SL_HIT": "stop_loss_hit",
+        "TP1_HIT": "tp1_target_hit",
+        "TP2_HIT": "tp2_target_hit",
+        "TIMEOUT": "timeout_no_target_hit",
+    }
+    return mapping.get(result, result.lower() if result else "")
+
+
+def _ensure_columns(cursor: sqlite3.Cursor, table_name: str, schema: list[tuple[str, str, str]]) -> None:
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    existing = {row[1] for row in cursor.fetchall()}
+    for column_name, column_type, default_sql in schema:
+        if column_name in existing:
+            continue
+        cursor.execute(
+            f"ALTER TABLE {table_name} "
+            f"ADD COLUMN {column_name} {column_type} DEFAULT {default_sql}"
+        )
+
+
 def _init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
-    cur.execute("""
+
+    open_defs = ",\n            ".join(f"{name} {column_type}" for name, column_type, _ in OPEN_TRADE_SCHEMA)
+    closed_defs = ",\n            ".join(
+        f"{name} {column_type}" for name, column_type, _ in OPEN_TRADE_SCHEMA + CLOSED_EXTRA_SCHEMA
+    )
+
+    cur.execute(
+        f"""
         CREATE TABLE IF NOT EXISTS open_trades (
-            id TEXT PRIMARY KEY,
-            pattern TEXT,
-            direction TEXT,
-            entry REAL,
-            sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            rr REAL,
-            opened_at INTEGER,
-            context_json TEXT
+            {open_defs}
         )
-    """)
-    cur.execute("""
+        """
+    )
+    cur.execute(
+        f"""
         CREATE TABLE IF NOT EXISTS closed_trades (
-            id TEXT PRIMARY KEY,
-            pattern TEXT,
-            direction TEXT,
-            entry REAL,
-            sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            rr REAL,
-            opened_at INTEGER,
-            context_json TEXT,
-            closed_at INTEGER,
-            result TEXT,
-            R REAL,
-            duration_seconds INTEGER
+            {closed_defs}
         )
-    """)
+        """
+    )
+
+    _ensure_columns(cur, "open_trades", OPEN_TRADE_SCHEMA)
+    _ensure_columns(cur, "closed_trades", OPEN_TRADE_SCHEMA + CLOSED_EXTRA_SCHEMA)
+
     conn.commit()
     conn.close()
+
+
+def _normalize_open_trade(trade: dict) -> dict:
+    opened_at_epoch = _coerce_int(trade.get("opened_at_epoch"))
+    if opened_at_epoch <= 0:
+        opened_at_epoch = _ms_from_utc_iso(trade.get("opened_at"))
+    if opened_at_epoch <= 0:
+        opened_at_epoch = int(time.time() * 1000)
+
+    opened_at_text = trade.get("opened_at") or _utc_iso_from_ms(opened_at_epoch)
+    context_json = trade.get("context_json")
+    if not context_json:
+        context_json = "{}"
+    elif not isinstance(context_json, str):
+        context_json = json.dumps(context_json, ensure_ascii=False)
+
+    return {
+        "id": str(trade.get("id", "")),
+        "pattern": str(trade.get("pattern", "")),
+        "timeframe": str(trade.get("timeframe", "")),
+        "direction": str(trade.get("direction", "")),
+        "entry": _coerce_float(trade.get("entry")),
+        "sl": _coerce_float(trade.get("sl")),
+        "tp1": _coerce_float(trade.get("tp1")),
+        "tp2": _coerce_float(trade.get("tp2")),
+        "rr": _coerce_float(trade.get("rr")),
+        "confidence": _coerce_float(trade.get("confidence")),
+        "context_adjusted_confidence": _coerce_float(trade.get("context_adjusted_confidence")),
+        "observer_score": _coerce_float(trade.get("observer_score")),
+        "delta_at_entry": _coerce_float(trade.get("delta_at_entry")),
+        "imbalance_at_entry": _coerce_float(trade.get("imbalance_at_entry")),
+        "cvd_at_entry": _coerce_float(trade.get("cvd_at_entry")),
+        "body_ratio": _coerce_float(trade.get("body_ratio")),
+        "micro_event": str(trade.get("micro_event", "")),
+        "pattern_reason": str(trade.get("pattern_reason", "")),
+        "entry_reason": str(trade.get("entry_reason", "")),
+        "sl_reason": str(trade.get("sl_reason", "")),
+        "tp_reason": str(trade.get("tp_reason", "")),
+        "session": str(trade.get("session", "")),
+        "trend_at_entry": str(trade.get("trend_at_entry", "")),
+        "regime_at_entry": str(trade.get("regime_at_entry", "")),
+        "opened_at": opened_at_text,
+        "opened_at_epoch": opened_at_epoch,
+        "context_json": context_json,
+    }
+
+
+def _normalize_closed_trade(trade: dict) -> dict:
+    closed_at_epoch = _coerce_int(trade.get("closed_at_epoch"))
+    if closed_at_epoch <= 0:
+        closed_at_epoch = _ms_from_utc_iso(trade.get("closed_at"))
+    closed_at_text = trade.get("closed_at") or _utc_iso_from_ms(closed_at_epoch or int(time.time() * 1000))
+
+    opened_at_epoch = _coerce_int(trade.get("opened_at_epoch"))
+    if opened_at_epoch <= 0:
+        opened_at_epoch = _ms_from_utc_iso(trade.get("opened_at"))
+    duration_seconds = _coerce_int(trade.get("duration_seconds"))
+    if duration_seconds <= 0 and opened_at_epoch and closed_at_epoch:
+        duration_seconds = max(0, (closed_at_epoch - opened_at_epoch) // 1000)
+
+    base = _normalize_open_trade(trade)
+    r_multiple = _coerce_float(trade.get("r_multiple", trade.get("R")))
+    return {
+        **base,
+        "closed_at": closed_at_text,
+        "closed_at_epoch": closed_at_epoch,
+        "result": str(trade.get("result", "")),
+        "exit_price": _coerce_float(trade.get("exit_price")),
+        "r_multiple": r_multiple,
+        "R": r_multiple,
+        "duration_seconds": duration_seconds,
+        "close_reason": str(trade.get("close_reason", "")),
+    }
 
 
 def _get_open_trades(db_path: Path) -> list[dict]:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cur.execute("SELECT * FROM open_trades")
-    rows = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT * FROM open_trades ORDER BY opened_at_epoch ASC, id ASC")
+    rows = [_normalize_open_trade(dict(r)) for r in cur.fetchall()]
     conn.close()
     return rows
 
 
 def _insert_open_trade(db_path: Path, trade: dict) -> None:
+    normalized = _normalize_open_trade(trade)
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO open_trades (id, pattern, direction, entry, sl, tp1, tp2, rr, opened_at, context_json)
-        VALUES (:id, :pattern, :direction, :entry, :sl, :tp1, :tp2, :rr, :opened_at, :context_json)
-    """, trade)
+    columns = ", ".join(OPEN_TRADE_COLUMNS)
+    placeholders = ", ".join(f":{column}" for column in OPEN_TRADE_COLUMNS)
+    cur.execute(
+        f"INSERT INTO open_trades ({columns}) VALUES ({placeholders})",
+        normalized,
+    )
     conn.commit()
     conn.close()
 
 
-def _close_trade_in_db(db_path: Path, trade_id: str, result: str, R: float, closed_at: int) -> None:
+def _close_trade_in_db(
+    db_path: Path,
+    trade_id: str,
+    result: str,
+    r_multiple: float,
+    exit_price: float,
+    closed_at_epoch: int,
+    close_reason: str,
+) -> dict | None:
     conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("SELECT * FROM open_trades WHERE id=?", (trade_id,))
     row = cur.fetchone()
     if row is None:
         conn.close()
-        return
-    cols = [desc[0] for desc in cur.description]
-    trade = dict(zip(cols, row))
-    duration = (closed_at - trade["opened_at"]) // 1000
+        return None
 
-    cur.execute("""
-        INSERT OR REPLACE INTO closed_trades
-        (id, pattern, direction, entry, sl, tp1, tp2, rr, opened_at, context_json,
-         closed_at, result, R, duration_seconds)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        trade["id"], trade["pattern"], trade["direction"],
-        trade["entry"], trade["sl"], trade["tp1"], trade["tp2"], trade["rr"],
-        trade["opened_at"], trade["context_json"],
-        closed_at, result, R, duration,
-    ))
+    trade = _normalize_open_trade(dict(row))
+    duration_seconds = max(0, (closed_at_epoch - trade["opened_at_epoch"]) // 1000)
+    closed_record = _normalize_closed_trade({
+        **trade,
+        "closed_at": _utc_iso_from_ms(closed_at_epoch),
+        "closed_at_epoch": closed_at_epoch,
+        "result": result,
+        "exit_price": exit_price,
+        "r_multiple": round(r_multiple, 4),
+        "duration_seconds": duration_seconds,
+        "close_reason": close_reason or _default_close_reason(result),
+    })
+
+    columns = ", ".join(CLOSED_TRADE_COLUMNS)
+    placeholders = ", ".join(f":{column}" for column in CLOSED_TRADE_COLUMNS)
+    cur.execute(
+        f"INSERT OR REPLACE INTO closed_trades ({columns}) VALUES ({placeholders})",
+        closed_record,
+    )
     cur.execute("DELETE FROM open_trades WHERE id=?", (trade_id,))
     conn.commit()
     conn.close()
+    return closed_record
 
 
-def _append_closed_trade(trade: dict, result: str, R: float, closed_at: int) -> None:
-    duration = (closed_at - trade["opened_at"]) // 1000
-    try:
-        ctx = json.loads(trade.get("context_json", "{}"))
-    except Exception:
-        ctx = {}
-    record = {
-        "id": trade["id"],
-        "pattern": trade["pattern"],
-        "direction": trade["direction"],
-        "entry": trade["entry"],
-        "sl": trade["sl"],
-        "tp1": trade["tp1"],
-        "tp2": trade["tp2"],
-        "rr": trade["rr"],
-        "opened_at": trade["opened_at"],
-        "closed_at": closed_at,
-        "result": result,
-        "R": R,
-        "duration_seconds": duration,
-        "context": ctx,
-    }
-    line = json.dumps(record) + "\n"
+def _append_closed_trade(closed_trade: dict) -> None:
+    line = json.dumps(closed_trade, ensure_ascii=False) + "\n"
     with open(config.CLOSED_TRADES_FILE, "a", encoding="utf-8") as f:
         f.write(line)
 
@@ -180,60 +344,93 @@ class PaperLifecycle:
             logger.info(f"Trade limit reached for {pattern} {direction}")
             return None
 
-        trade_id = str(uuid.uuid4())[:8]
         now_ms = int(time.time() * 1000)
+        trade_id = str(uuid.uuid4())[:8]
         context = {
             "tags": decision.get("tags", []),
-            "rr": decision.get("rr"),
+            "combo_key": decision.get("combo_key", ""),
+            "trend_reason": decision.get("trend_reason", ""),
+            "regime_reason": decision.get("regime_reason", ""),
+            "lineage_chain": decision.get("lineage_chain", ""),
         }
-        trade = {
+        trade = _normalize_open_trade({
             "id": trade_id,
             "pattern": pattern,
+            "timeframe": decision.get("timeframe", "1m"),
             "direction": direction,
-            "entry": decision["entry"],
-            "sl": decision["sl"],
-            "tp1": decision["tp1"],
-            "tp2": decision.get("tp2", decision["tp1"]),
+            "entry": decision.get("entry"),
+            "sl": decision.get("sl"),
+            "tp1": decision.get("tp1"),
+            "tp2": decision.get("tp2", decision.get("tp1", 0)),
             "rr": decision.get("rr", 0.0),
-            "opened_at": now_ms,
-            "context_json": json.dumps(context),
-        }
+            "confidence": decision.get("confidence", 0.0),
+            "context_adjusted_confidence": decision.get("context_adjusted_confidence", 0.0),
+            "observer_score": decision.get("observer_score", 0.0),
+            "delta_at_entry": decision.get("delta_at_entry", 0.0),
+            "imbalance_at_entry": decision.get("imbalance_at_entry", 0.0),
+            "cvd_at_entry": decision.get("cvd_at_entry", 0.0),
+            "body_ratio": decision.get("body_ratio", 0.0),
+            "micro_event": decision.get("micro_event", ""),
+            "pattern_reason": decision.get("pattern_reason", ""),
+            "entry_reason": decision.get("entry_reason", ""),
+            "sl_reason": decision.get("sl_reason", ""),
+            "tp_reason": decision.get("tp_reason", ""),
+            "session": decision.get("session", ""),
+            "trend_at_entry": decision.get("trend_at_entry", ""),
+            "regime_at_entry": decision.get("regime_at_entry", ""),
+            "opened_at": _utc_iso_from_ms(now_ms),
+            "opened_at_epoch": now_ms,
+            "context_json": context,
+        })
         _insert_open_trade(config.PAPER_TRADES_DB, trade)
-        logger.info(f"Opened paper trade {trade_id}: {pattern} {direction} entry={trade['entry']}")
+        logger.info(
+            "Opened paper trade %s: %s %s entry=%s conf=%.3f ctx_conf=%.3f",
+            trade_id,
+            pattern,
+            direction,
+            trade["entry"],
+            trade["confidence"],
+            trade["context_adjusted_confidence"],
+        )
         return trade
 
-    def _check_exits(self, trades: list[dict], price: float) -> list[tuple[str, str, float]]:
-        exits = []
+    def _check_exits(self, trades: list[dict], price: float) -> list[tuple[str, str, float, float, str]]:
+        exits: list[tuple[str, str, float, float, str]] = []
         now_ms = int(time.time() * 1000)
-        for t in trades:
-            direction = t["direction"]
-            entry = t["entry"]
-            sl = t["sl"]
-            tp1 = t["tp1"]
-            tp2 = t.get("tp2", tp1)
+        for trade in trades:
+            direction = trade["direction"]
+            entry = _coerce_float(trade["entry"])
+            sl = _coerce_float(trade["sl"])
+            tp1 = _coerce_float(trade["tp1"])
+            tp2 = _coerce_float(trade.get("tp2", tp1))
+            opened_at_epoch = _coerce_int(trade.get("opened_at_epoch"))
+            if opened_at_epoch <= 0:
+                opened_at_epoch = _ms_from_utc_iso(trade.get("opened_at"))
             risk = abs(entry - sl) or 1e-9
 
-            if (now_ms - t["opened_at"]) >= TIMEOUT_SECONDS * 1000:
-                R = (price - entry) / risk if direction == "LONG" else (entry - price) / risk
-                exits.append((t["id"], "TIMEOUT", round(R, 4)))
-            elif direction == "LONG":
+            if (now_ms - opened_at_epoch) >= TIMEOUT_SECONDS * 1000:
+                r_multiple = (price - entry) / risk if direction == "LONG" else (entry - price) / risk
+                exits.append((trade["id"], "TIMEOUT", round(r_multiple, 4), round(price, 2), "timeout_no_target_hit"))
+                continue
+
+            if direction == "LONG":
                 if price <= sl:
-                    exits.append((t["id"], "SL_HIT", round(-1.0, 4)))
+                    exits.append((trade["id"], "SL_HIT", -1.0, round(sl, 2), "stop_loss_hit"))
                 elif price >= tp2:
-                    R = (tp2 - entry) / risk
-                    exits.append((t["id"], "TP2_HIT", round(R, 4)))
+                    r_multiple = (tp2 - entry) / risk
+                    exits.append((trade["id"], "TP2_HIT", round(r_multiple, 4), round(tp2, 2), "tp2_target_hit"))
                 elif price >= tp1:
-                    R = (tp1 - entry) / risk
-                    exits.append((t["id"], "TP1_HIT", round(R, 4)))
-            else:  # SHORT
+                    r_multiple = (tp1 - entry) / risk
+                    exits.append((trade["id"], "TP1_HIT", round(r_multiple, 4), round(tp1, 2), "tp1_target_hit"))
+            else:
                 if price >= sl:
-                    exits.append((t["id"], "SL_HIT", round(-1.0, 4)))
+                    exits.append((trade["id"], "SL_HIT", -1.0, round(sl, 2), "stop_loss_hit"))
                 elif price <= tp2:
-                    R = (entry - tp2) / risk
-                    exits.append((t["id"], "TP2_HIT", round(R, 4)))
+                    r_multiple = (entry - tp2) / risk
+                    exits.append((trade["id"], "TP2_HIT", round(r_multiple, 4), round(tp2, 2), "tp2_target_hit"))
                 elif price <= tp1:
-                    R = (entry - tp1) / risk
-                    exits.append((t["id"], "TP1_HIT", round(R, 4)))
+                    r_multiple = (entry - tp1) / risk
+                    exits.append((trade["id"], "TP1_HIT", round(r_multiple, 4), round(tp1, 2), "tp1_target_hit"))
         return exits
 
     async def run(self) -> None:
@@ -247,7 +444,6 @@ class PaperLifecycle:
                     price = await _fetch_price(session)
                     open_trades = _get_open_trades(config.PAPER_TRADES_DB)
 
-                    # Open new trade if allowed
                     decision_ts = decision.get("timestamp_ms", 0)
                     if (
                         decision.get("decision") == "ALLOW_PAPER"
@@ -257,19 +453,30 @@ class PaperLifecycle:
                         self._last_decision_ts = decision_ts
                         open_trades = _get_open_trades(config.PAPER_TRADES_DB)
 
-                    # Check exits
-                    if price:
+                    if price is not None:
                         exits = self._check_exits(open_trades, price)
-                        for trade_id, result, R in exits:
+                        for trade_id, result, r_multiple, exit_price, close_reason in exits:
                             now_ms = int(time.time() * 1000)
-                            trade = next((t for t in open_trades if t["id"] == trade_id), None)
-                            if trade:
-                                _close_trade_in_db(config.PAPER_TRADES_DB, trade_id, result, R, now_ms)
-                                _append_closed_trade(trade, result, R, now_ms)
-                                logger.info(f"Closed trade {trade_id}: {result} R={R}")
+                            closed_trade = _close_trade_in_db(
+                                config.PAPER_TRADES_DB,
+                                trade_id,
+                                result,
+                                r_multiple,
+                                exit_price,
+                                now_ms,
+                                close_reason,
+                            )
+                            if closed_trade:
+                                _append_closed_trade(closed_trade)
+                                logger.info(
+                                    "Closed trade %s: %s exit=%s R=%.4f",
+                                    trade_id,
+                                    result,
+                                    exit_price,
+                                    r_multiple,
+                                )
                         open_trades = _get_open_trades(config.PAPER_TRADES_DB)
 
-                    # Write lifecycle state
                     state = {
                         "timestamp_ms": int(time.time() * 1000),
                         "current_price": price,
@@ -277,7 +484,7 @@ class PaperLifecycle:
                         "open_trades": open_trades,
                     }
                     tmp = config.LIFECYCLE_FILE.with_suffix(".tmp")
-                    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+                    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
                     tmp.replace(config.LIFECYCLE_FILE)
 
                 except Exception as e:

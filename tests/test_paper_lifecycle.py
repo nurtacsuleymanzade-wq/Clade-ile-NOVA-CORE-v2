@@ -38,6 +38,15 @@ def _get_closed_count(db_path: Path) -> int:
     return count
 
 
+def _get_columns(db_path: Path, table_name: str) -> list[str]:
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table_name})")
+    columns = [row[1] for row in cur.fetchall()]
+    conn.close()
+    return columns
+
+
 def _get_open_trades(db_path: Path) -> list[dict]:
     from services.realtime.paper_lifecycle import _get_open_trades
     with patch.object(config, "PAPER_TRADES_DB", db_path):
@@ -69,6 +78,40 @@ def test_opens_trade_on_allow_paper():
             assert trade is not None, "Trade should be opened"
             count = _get_open_count(db_path)
             assert count == 1, f"Expected 1 open trade, got {count}"
+            trades = _get_open_trades(db_path)
+            assert trades[0]["pattern_reason"] == ""
+            assert "context_adjusted_confidence" in trades[0]
+
+
+def test_trade_dna_schema_columns_exist():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        open_columns = _get_columns(db_path, "open_trades")
+        closed_columns = _get_columns(db_path, "closed_trades")
+
+        for required in (
+            "timeframe",
+            "confidence",
+            "context_adjusted_confidence",
+            "observer_score",
+            "delta_at_entry",
+            "imbalance_at_entry",
+            "cvd_at_entry",
+            "body_ratio",
+            "micro_event",
+            "pattern_reason",
+            "entry_reason",
+            "sl_reason",
+            "tp_reason",
+            "session",
+            "trend_at_entry",
+            "regime_at_entry",
+            "opened_at",
+        ):
+            assert required in open_columns
+
+        for required in ("closed_at", "exit_price", "r_multiple", "close_reason"):
+            assert required in closed_columns
 
 
 def test_closes_on_sl_hit():
@@ -103,9 +146,14 @@ def test_closes_on_sl_hit():
             assert exits[0][1] == "SL_HIT"
             assert exits[0][2] == -1.0
 
-            _close_trade_in_db(db_path, "test01", "SL_HIT", -1.0, now_ms)
+            closed_trade = _close_trade_in_db(db_path, "test01", "SL_HIT", -1.0, 49850.0, now_ms, "stop_loss_hit")
             assert _get_open_count(db_path) == 0
             assert _get_closed_count(db_path) == 1
+            assert closed_trade is not None
+            assert closed_trade["exit_price"] == 49850.0
+            assert closed_trade["close_reason"] == "stop_loss_hit"
+            assert closed_trade["r_multiple"] == -1.0
+            assert closed_trade["closed_at"]
 
 
 def test_closes_on_tp1_hit():
@@ -137,6 +185,8 @@ def test_closes_on_tp1_hit():
             assert len(exits) == 1
             assert exits[0][1] == "TP1_HIT"
             assert exits[0][2] > 0, "R should be positive on TP1"
+            assert exits[0][3] == 50300.0
+            assert exits[0][4] == "tp1_target_hit"
 
 
 def test_respects_max_open_trades():
@@ -216,3 +266,51 @@ def test_respects_max_same_direction():
             }
             result = pl._open_trade(decision, open_trades)
             assert result is None, "Should not open when MAX_SAME_DIRECTION reached"
+
+
+def test_open_trade_persists_trade_dna_fields():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import PaperLifecycle
+            pl = PaperLifecycle.__new__(PaperLifecycle)
+            pl._last_decision_ts = 0
+
+            decision = {
+                "decision": "ALLOW_PAPER",
+                "timestamp_ms": int(time.time() * 1000),
+                "pattern": "STOP_HUNT_RECLAIM_LONG",
+                "timeframe": "1m",
+                "direction": "LONG",
+                "entry": 50000.0,
+                "sl": 49850.0,
+                "tp1": 50300.0,
+                "tp2": 50600.0,
+                "rr": 2.0,
+                "confidence": 0.7,
+                "context_adjusted_confidence": 0.84,
+                "observer_score": 4.2,
+                "delta_at_entry": 1.1,
+                "imbalance_at_entry": 0.2,
+                "cvd_at_entry": 3.5,
+                "body_ratio": 0.4,
+                "micro_event": "PRESSURE_BUILDING_LONG",
+                "pattern_reason": "wick_sweep_and_reclaim",
+                "entry_reason": "reclaim_after_sweep_low",
+                "sl_reason": "below_sweep_low_invalidation",
+                "tp_reason": "nearest_equal_high_liquidity",
+                "session": "LONDON",
+                "trend_at_entry": "TREND_UP",
+                "regime_at_entry": "EXPANSION",
+                "trend_reason": "swings high=4, low=3",
+                "regime_reason": "atr=10, delta_consistency=0.8",
+                "tags": [],
+            }
+            trade = pl._open_trade(decision, [])
+            assert trade is not None
+            open_trade = _get_open_trades(db_path)[0]
+            assert open_trade["pattern_reason"] == "wick_sweep_and_reclaim"
+            assert open_trade["entry_reason"] == "reclaim_after_sweep_low"
+            assert open_trade["sl_reason"] == "below_sweep_low_invalidation"
+            assert open_trade["tp_reason"] == "nearest_equal_high_liquidity"
+            assert open_trade["context_adjusted_confidence"] == 0.84

@@ -8,23 +8,30 @@ from services.research.edge_matrix import compute_edge_matrix_from_trades
 
 def make_trade(pattern="TRAP", direction="LONG", result="TP1_HIT", R=1.5,
                opened_at=1700000000000, duration_seconds=600,
-               tags=None) -> dict:
+               tags=None, timeframe="1m", session="LONDON", trend="TREND_UP", regime="EXPANSION") -> dict:
     tags = tags or ["trend_trend_up", "regime_expansion"]
     return {
         "id": f"t_{pattern}_{result}",
         "pattern": pattern,
+        "timeframe": timeframe,
         "direction": direction,
         "entry": 50000.0,
         "sl": 49900.0,
         "tp1": 50150.0,
         "tp2": 50300.0,
         "rr": 1.5,
-        "opened_at": opened_at,
-        "closed_at": opened_at + duration_seconds * 1000,
+        "opened_at": "2026-05-22T03:00:00Z",
+        "opened_at_epoch": opened_at,
+        "closed_at": "2026-05-22T03:10:00Z",
+        "closed_at_epoch": opened_at + duration_seconds * 1000,
         "result": result,
         "R": R,
+        "r_multiple": R,
         "duration_seconds": duration_seconds,
         "context": {"tags": tags},
+        "session": session,
+        "trend_at_entry": trend,
+        "regime_at_entry": regime,
     }
 
 
@@ -86,10 +93,12 @@ def test_combination_keys_generated():
         make_trade("TRAP", "LONG", "TP1_HIT", 1.5, tags=["trend_trend_up", "regime_expansion"]),
     ]
     matrix = compute_edge_matrix_from_trades(trades)
-    # Should have pattern+trend combination
+    # Should have pattern+trend combination and canonical combo key
     keys = list(matrix.keys())
     pattern_trend_keys = [k for k in keys if "pattern:TRAP" in k and "trend:" in k]
     assert len(pattern_trend_keys) > 0, f"Expected pattern+trend key, got keys: {keys}"
+    canonical_keys = [k for k in keys if k.startswith("TRAP|1m|LONDON|TREND_UP")]
+    assert len(canonical_keys) == 1
 
 
 def test_empty_trades_returns_empty_matrix():
@@ -106,3 +115,22 @@ def test_avg_R_positive_when_winning():
     stats = matrix["pattern:STOP_HUNT"]
     assert stats["avg_R"] > 0, "avg_R should be positive for winning trades"
     assert abs(stats["avg_R"] - 2.5) < 0.01
+
+
+def test_timeout_excluded_from_edge_sample_but_counted():
+    trades = [
+        make_trade("TRAP", "LONG", "TP1_HIT", 1.5),
+        make_trade("TRAP", "LONG", "TIMEOUT", 0.2),
+    ]
+    matrix = compute_edge_matrix_from_trades(trades)
+    stats = matrix["TRAP|1m|LONDON|TREND_UP"]
+    assert stats["sample_count"] == 1
+    assert stats["timeout_count"] == 1
+
+
+def test_status_fields_present_on_canonical_combo():
+    trades = [make_trade("TRAP", "LONG", "TP1_HIT", 1.5) for _ in range(30)]
+    matrix = compute_edge_matrix_from_trades(trades)
+    stats = matrix["TRAP|1m|LONDON|TREND_UP"]
+    assert stats["status"] == "ACTIVE"
+    assert stats["promote_reason"] is not None
