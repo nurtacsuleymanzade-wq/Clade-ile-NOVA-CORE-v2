@@ -42,6 +42,40 @@ def _summary_key(entry: dict) -> str:
     return f"{entry.get('pattern', '')}|{entry.get('session', '')}|{entry.get('regime', '')}"
 
 
+def _evaluate_matrix(matrix: dict) -> tuple[list[str], list[str], list[str]]:
+    """Compatibility wrapper for legacy tests expecting key lists."""
+    sample_building: list[str] = []
+    active: list[str] = []
+    suppressed: list[str] = []
+
+    for key, stats in matrix.items():
+        sample_count = stats.get("sample_count", 0)
+        expectancy = stats.get("expectancy", 0.0)
+        status, _, _ = evaluate_combo_status(sample_count, expectancy)
+        if status == "ACTIVE":
+            active.append(key)
+        elif status == "SUPPRESSED":
+            suppressed.append(key)
+        else:
+            sample_building.append(key)
+
+    return sample_building, active, suppressed
+
+
+def _extract_pattern_names(suppressed_keys: list[str]) -> list[str]:
+    """Compatibility helper preserved for legacy callers."""
+    names = set()
+    for key in suppressed_keys:
+        parts = key.split("|")
+        for part in parts:
+            if part.startswith("pattern:"):
+                names.add(part.replace("pattern:", ""))
+                continue
+        if "|" not in key and ":" not in key:
+            names.add(key)
+    return sorted(names)
+
+
 def _status_lists(canonical_combos: dict[str, dict]) -> tuple[list[dict], list[dict], list[dict], dict[str, dict]]:
     building: list[dict] = []
     active: list[dict] = []
