@@ -108,25 +108,13 @@ def _load_suppressed_state() -> dict:
     return _load_json(config.SUPPRESSED_FILE) or {}
 
 
-def _find_suppressed_entry(
-    suppressed_state: dict,
-    combo_key: str,
-    pattern: str,
-    session: str,
-    trend: str,
-    regime: str,
-) -> dict | None:
+def _find_suppressed_entry(suppressed_state: dict, combo_key: str) -> dict | None:
     combinations = suppressed_state.get("combinations", {})
-    if combo_key in combinations and combinations[combo_key].get("status") == "SUPPRESSED":
-        return combinations[combo_key]
-
-    summary_key = f"{pattern}|{session}|{regime}"
+    entry = combinations.get(combo_key)
+    if entry and entry.get("status") == "SUPPRESSED":
+        return entry
     for item in suppressed_state.get("suppressed", []):
         if item.get("combo_key") == combo_key:
-            return item
-        if item.get("summary_key") == summary_key:
-            return item
-        if item.get("pattern") == pattern and item.get("trend") == trend and item.get("status") == "SUPPRESSED":
             return item
     return None
 
@@ -186,7 +174,8 @@ def _make_decision(
 
     timeframe = str(geometry.get("timeframe", "1m"))
     session = _utc_session(now_ms)
-    combo_key = f"{pattern}|{timeframe}|{session}|{trend_dir}"
+    # Canonical combo key: pattern|direction|timeframe|session|trend|regime
+    combo_key = f"{pattern}|{direction}|{timeframe}|{session}|{trend_dir}|{regime_type}"
     decision.update({
         "timeframe": timeframe,
         "session": session,
@@ -214,23 +203,16 @@ def _make_decision(
         })
         return decision
 
-    suppressed_entry = _find_suppressed_entry(
-        suppressed_state,
-        combo_key,
-        pattern,
-        session,
-        trend_dir,
-        regime_type,
-    )
+    suppressed_entry = _find_suppressed_entry(suppressed_state, combo_key)
     if suppressed_entry:
         decision.update({
             "decision": "BLOCKED",
-            "reason": "COMBINATION_SUPPRESSED",
+            "reason": "SUPPRESSED_COMBINATION",
             "tags": ["suppressed"],
         })
         return decision
 
-    if context_adjusted_confidence < 0.3:
+    if context_adjusted_confidence < config.MIN_CONTEXT_CONFIDENCE:
         decision.update({
             "decision": "BLOCKED",
             "reason": "LOW_CONTEXT_CONFIDENCE",

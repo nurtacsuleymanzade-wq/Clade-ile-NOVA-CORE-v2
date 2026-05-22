@@ -154,6 +154,7 @@ def _build_stats(key: str, group: list[dict], canonical: bool) -> dict:
     return {
         "combo_key": key,
         "pattern": exemplar.get("pattern", "UNKNOWN"),
+        "direction": exemplar.get("direction", "NEUTRAL"),
         "timeframe": exemplar.get("timeframe", "1m") if canonical else exemplar.get("timeframe", "*"),
         "session": exemplar.get("session", "OFF_SESSION") if canonical else exemplar.get("session", "*"),
         "trend": exemplar.get("trend_at_entry", "NO_TREND") if canonical else exemplar.get("trend_at_entry", "*"),

@@ -76,18 +76,31 @@ def _extract_pattern_names(suppressed_keys: list[str]) -> list[str]:
     return sorted(names)
 
 
+def _canonical_combo_key(combo: dict) -> str:
+    pattern = combo.get("pattern", "")
+    direction = combo.get("direction", "")
+    timeframe = combo.get("timeframe", "1m")
+    session = combo.get("session", "OFF_SESSION")
+    trend = combo.get("trend", "NO_TREND")
+    regime = combo.get("regime", "UNKNOWN")
+    return f"{pattern}|{direction}|{timeframe}|{session}|{trend}|{regime}"
+
+
 def _status_lists(canonical_combos: dict[str, dict]) -> tuple[list[dict], list[dict], list[dict], dict[str, dict]]:
     building: list[dict] = []
     active: list[dict] = []
     suppressed: list[dict] = []
     combinations: dict[str, dict] = {}
 
-    for combo_key, combo in canonical_combos.items():
+    for _old_key, combo in canonical_combos.items():
+        # Rebuild canonical key in the direction+regime-aware format
+        combo_key = _canonical_combo_key(combo)
         sample_count = combo.get("sample_count", 0)
         expectancy = combo.get("expectancy", 0.0)
         status, suppress_reason, promote_reason = evaluate_combo_status(sample_count, expectancy)
         enriched = {
             **combo,
+            "combo_key": combo_key,
             "status": status,
             "suppress_reason": suppress_reason,
             "promote_reason": promote_reason,

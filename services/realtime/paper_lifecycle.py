@@ -1,6 +1,7 @@
 """
 Opens/closes paper trades based on decision_gate output.
-Monitors price via bookTicker, closes on SL/TP/timeout.
+Monitors price via bookTicker, closes on SL/TP/THESIS_BROKEN/TIMEOUT.
+Includes arming phase, emergency bypass, and MAE/MFE tracking.
 """
 import asyncio
 import json
@@ -51,6 +52,10 @@ OPEN_TRADE_SCHEMA = [
     ("opened_at", "TEXT", "''"),
     ("opened_at_epoch", "INTEGER", "0"),
     ("context_json", "TEXT", "'{}'"),
+    ("min_exit_delay_seconds", "INTEGER", "0"),
+    ("exit_armed_at", "INTEGER", "0"),
+    ("mae", "REAL", "0"),
+    ("mfe", "REAL", "0"),
 ]
 
 CLOSED_EXTRA_SCHEMA = [
@@ -119,6 +124,7 @@ def _default_close_reason(result: str) -> str:
         "TP1_HIT": "tp1_target_hit",
         "TP2_HIT": "tp2_target_hit",
         "TIMEOUT": "timeout_no_target_hit",
+        "THESIS_BROKEN": "thesis_broken",
     }
     return mapping.get(result, result.lower() if result else "")
 
@@ -209,6 +215,10 @@ def _normalize_open_trade(trade: dict) -> dict:
         "opened_at": opened_at_text,
         "opened_at_epoch": opened_at_epoch,
         "context_json": context_json,
+        "min_exit_delay_seconds": _coerce_int(trade.get("min_exit_delay_seconds")),
+        "exit_armed_at": _coerce_int(trade.get("exit_armed_at")),
+        "mae": _coerce_float(trade.get("mae")),
+        "mfe": _coerce_float(trade.get("mfe")),
     }
 
 
@@ -259,6 +269,17 @@ def _insert_open_trade(db_path: Path, trade: dict) -> None:
     cur.execute(
         f"INSERT INTO open_trades ({columns}) VALUES ({placeholders})",
         normalized,
+    )
+    conn.commit()
+    conn.close()
+
+
+def _update_mae_mfe(db_path: Path, trade_id: str, mae: float, mfe: float) -> None:
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE open_trades SET mae=?, mfe=? WHERE id=?",
+        (round(mae, 6), round(mfe, 6), trade_id),
     )
     conn.commit()
     conn.close()
@@ -323,6 +344,51 @@ async def _fetch_price(session: aiohttp.ClientSession) -> float | None:
         return None
 
 
+def _min_arming_seconds(pattern: str) -> int:
+    if pattern.startswith("STOP_HUNT_RECLAIM_"):
+        return 30
+    if pattern.startswith("CONTINUATION_"):
+        return 60
+    if pattern == "EXPANSION":
+        return 15
+    if pattern in ("REVERSAL", "ABSORPTION"):
+        return 60
+    return 30
+
+
+def _check_thesis_broken(trade: dict, price: float, candle_dna: dict | None) -> bool:
+    if not candle_dna:
+        return False
+    pattern = trade.get("pattern", "")
+    direction = trade.get("direction", "")
+    entry = _coerce_float(trade.get("entry"))
+    cvd = _coerce_float(candle_dna.get("cvd"))
+    body_ratio = _coerce_float(candle_dna.get("body_ratio"))
+
+    is_sh_long = pattern.startswith("STOP_HUNT_RECLAIM_LONG") or (
+        pattern.startswith("STOP_HUNT_RECLAIM") and direction == "LONG"
+    )
+    is_sh_short = pattern.startswith("STOP_HUNT_RECLAIM_SHORT") or (
+        pattern.startswith("STOP_HUNT_RECLAIM") and direction == "SHORT"
+    )
+    is_cont_long = pattern == "CONTINUATION_LONG" or (
+        pattern.startswith("CONTINUATION") and direction == "LONG"
+    )
+    is_cont_short = pattern == "CONTINUATION_SHORT" or (
+        pattern.startswith("CONTINUATION") and direction == "SHORT"
+    )
+
+    if is_sh_long:
+        return cvd < -0.5 and body_ratio > 0.6 and price < entry
+    if is_sh_short:
+        return cvd > 0.5 and body_ratio > 0.6 and price > entry
+    if is_cont_long:
+        return cvd < -0.3 and price < entry * 0.999
+    if is_cont_short:
+        return cvd > 0.3 and price > entry * 1.001
+    return False
+
+
 class PaperLifecycle:
     def __init__(self):
         _init_db(config.PAPER_TRADES_DB)
@@ -348,6 +414,9 @@ class PaperLifecycle:
 
         now_ms = int(time.time() * 1000)
         trade_id = str(uuid.uuid4())[:8]
+        min_exit_delay_seconds = _min_arming_seconds(pattern)
+        exit_armed_at = now_ms + min_exit_delay_seconds * 1000
+
         context = {
             "tags": decision.get("tags", []),
             "combo_key": decision.get("combo_key", ""),
@@ -383,22 +452,34 @@ class PaperLifecycle:
             "opened_at": _utc_iso_from_ms(now_ms),
             "opened_at_epoch": now_ms,
             "context_json": context,
+            "min_exit_delay_seconds": min_exit_delay_seconds,
+            "exit_armed_at": exit_armed_at,
+            "mae": 0.0,
+            "mfe": 0.0,
         })
         _insert_open_trade(config.PAPER_TRADES_DB, trade)
         logger.info(
-            "Opened paper trade %s: %s %s entry=%s conf=%.3f ctx_conf=%.3f",
+            "Opened paper trade %s: %s %s entry=%s conf=%.3f ctx_conf=%.3f armed_in=%ds",
             trade_id,
             pattern,
             direction,
             trade["entry"],
             trade["confidence"],
             trade["context_adjusted_confidence"],
+            min_exit_delay_seconds,
         )
         return trade
 
-    def _check_exits(self, trades: list[dict], price: float) -> list[tuple[str, str, float, float, str]]:
+    def _check_exits(
+        self,
+        trades: list[dict],
+        price: float,
+        candle_dna: dict | None = None,
+        regime_atr: float | None = None,
+    ) -> list[tuple[str, str, float, float, str]]:
         exits: list[tuple[str, str, float, float, str]] = []
         now_ms = int(time.time() * 1000)
+
         for trade in trades:
             direction = trade["direction"]
             entry = _coerce_float(trade["entry"])
@@ -408,31 +489,72 @@ class PaperLifecycle:
             opened_at_epoch = _coerce_int(trade.get("opened_at_epoch"))
             if opened_at_epoch <= 0:
                 opened_at_epoch = _ms_from_utc_iso(trade.get("opened_at"))
+            exit_armed_at = _coerce_int(trade.get("exit_armed_at"))
             risk = abs(entry - sl) or 1e-9
 
+            # TIMEOUT always fires regardless of arming
             if (now_ms - opened_at_epoch) >= TIMEOUT_SECONDS * 1000:
                 r_multiple = (price - entry) / risk if direction == "LONG" else (entry - price) / risk
                 exits.append((trade["id"], "TIMEOUT", round(r_multiple, 4), round(price, 2), "timeout_no_target_hit"))
                 continue
 
+            # Arming gate: exit_armed_at <= 0 means old trade without arming → treat as armed
+            is_armed = (exit_armed_at <= 0) or (now_ms >= exit_armed_at)
+
+            # Emergency bypass threshold (SL only)
+            if regime_atr and regime_atr > 0:
+                emergency_threshold = regime_atr * 1.2
+            else:
+                emergency_threshold = entry * 0.015
+
             if direction == "LONG":
-                if price <= sl:
+                adverse_move = entry - price
+                sl_triggered = price <= sl
+            else:
+                adverse_move = price - entry
+                sl_triggered = price >= sl
+
+            is_emergency = adverse_move > emergency_threshold
+
+            # Emergency bypass: adverse move exceeds threshold during arming → close now
+            if not is_armed and is_emergency:
+                r_multiple = (price - entry) / risk if direction == "LONG" else (entry - price) / risk
+                exits.append((trade["id"], "SL_HIT", round(r_multiple, 4), round(price, 2), "EMERGENCY_ADVERSE_MOVE"))
+                continue
+
+            # SL check: fires when armed and price reaches SL level
+            if sl_triggered:
+                if is_armed:
                     exits.append((trade["id"], "SL_HIT", -1.0, round(sl, 2), "stop_loss_hit"))
-                elif price >= tp2:
+                # Price is at/past SL — skip TP and THESIS_BROKEN regardless
+                continue
+
+            # Not yet armed: skip TP and THESIS_BROKEN
+            if not is_armed:
+                continue
+
+            # TP and THESIS_BROKEN only when armed and SL not triggered
+            if direction == "LONG":
+                if price >= tp2:
                     r_multiple = (tp2 - entry) / risk
                     exits.append((trade["id"], "TP2_HIT", round(r_multiple, 4), round(tp2, 2), "tp2_target_hit"))
                 elif price >= tp1:
                     r_multiple = (tp1 - entry) / risk
                     exits.append((trade["id"], "TP1_HIT", round(r_multiple, 4), round(tp1, 2), "tp1_target_hit"))
+                elif _check_thesis_broken(trade, price, candle_dna):
+                    r_multiple = (price - entry) / risk
+                    exits.append((trade["id"], "THESIS_BROKEN", round(r_multiple, 4), round(price, 2), "thesis_broken"))
             else:
-                if price >= sl:
-                    exits.append((trade["id"], "SL_HIT", -1.0, round(sl, 2), "stop_loss_hit"))
-                elif price <= tp2:
+                if price <= tp2:
                     r_multiple = (entry - tp2) / risk
                     exits.append((trade["id"], "TP2_HIT", round(r_multiple, 4), round(tp2, 2), "tp2_target_hit"))
                 elif price <= tp1:
                     r_multiple = (entry - tp1) / risk
                     exits.append((trade["id"], "TP1_HIT", round(r_multiple, 4), round(tp1, 2), "tp1_target_hit"))
+                elif _check_thesis_broken(trade, price, candle_dna):
+                    r_multiple = (entry - price) / risk
+                    exits.append((trade["id"], "THESIS_BROKEN", round(r_multiple, 4), round(price, 2), "thesis_broken"))
+
         return exits
 
     async def run(self) -> None:
@@ -456,7 +578,29 @@ class PaperLifecycle:
                         open_trades = _get_open_trades(config.PAPER_TRADES_DB)
 
                     if price is not None:
-                        exits = self._check_exits(open_trades, price)
+                        # Update MAE/MFE for every open trade each tick
+                        for trade in open_trades:
+                            t_entry = _coerce_float(trade["entry"])
+                            t_direction = trade["direction"]
+                            t_mae = _coerce_float(trade.get("mae", 0))
+                            t_mfe = _coerce_float(trade.get("mfe", 0))
+                            if t_direction == "LONG":
+                                new_mae = max(t_mae, t_entry - price)
+                                new_mfe = max(t_mfe, price - t_entry)
+                            else:
+                                new_mae = max(t_mae, price - t_entry)
+                                new_mfe = max(t_mfe, t_entry - price)
+                            _update_mae_mfe(config.PAPER_TRADES_DB, trade["id"], new_mae, new_mfe)
+
+                        # Read regime ATR for emergency bypass
+                        regime_data = _load_json(config.REGIME_FILE) or {}
+                        regime_atr = _coerce_float(regime_data.get("atr")) or None
+                        candle_dna = _load_json(config.CANDLE_DNA_STATE_FILE)
+
+                        # Re-read trades to include updated MAE/MFE
+                        open_trades = _get_open_trades(config.PAPER_TRADES_DB)
+
+                        exits = self._check_exits(open_trades, price, candle_dna, regime_atr)
                         for trade_id, result, r_multiple, exit_price, close_reason in exits:
                             now_ms = int(time.time() * 1000)
                             closed_trade = _close_trade_in_db(
@@ -471,11 +615,13 @@ class PaperLifecycle:
                             if closed_trade:
                                 _append_closed_trade(closed_trade)
                                 logger.info(
-                                    "Closed trade %s: %s exit=%s R=%.4f",
+                                    "Closed trade %s: %s exit=%s R=%.4f mae=%.4f mfe=%.4f",
                                     trade_id,
                                     result,
                                     exit_price,
                                     r_multiple,
+                                    closed_trade.get("mae", 0),
+                                    closed_trade.get("mfe", 0),
                                 )
                         open_trades = _get_open_trades(config.PAPER_TRADES_DB)
 
