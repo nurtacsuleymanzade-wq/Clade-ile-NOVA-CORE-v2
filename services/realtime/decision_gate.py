@@ -86,38 +86,152 @@ def _is_continuation_pattern(pattern: str) -> bool:
     return pattern == "CONTINUATION" or pattern.startswith("CONTINUATION_")
 
 
+def _base_pattern_name(pattern: str) -> str:
+    if not pattern:
+        return "NONE"
+    if pattern in {"STOP_HUNT_RECLAIM_LONG", "STOP_HUNT_RECLAIM_SHORT"}:
+        return "STOP_HUNT"
+    if pattern in {"ABSORPTION_REVERSAL_LONG", "ABSORPTION_REVERSAL_SHORT"}:
+        return "ABSORPTION"
+    if pattern.endswith("_LONG") or pattern.endswith("_SHORT"):
+        return pattern.rsplit("_", 1)[0]
+    return pattern
+
+
+def _is_reversal_pattern(pattern: str) -> bool:
+    return _base_pattern_name(pattern) in {"STOP_HUNT", "ABSORPTION", "REVERSAL", "TRAP"}
+
+
 def _context_block_reason(pattern: str, session: str, trend: str, regime: str) -> str | None:
     if _is_continuation_pattern(pattern) and (regime == "COMPRESSION" or trend == "NO_TREND"):
         return "CONTINUATION_REQUIRES_TREND"
     if session == "OFF_SESSION" and regime == "COMPRESSION":
+        if _is_reversal_pattern(pattern):
+            return None
         return "LOW_QUALITY_SESSION_CONTEXT"
     if regime == "COMPRESSION" and trend == "NO_TREND":
         return "INVALID_MARKET_CONTEXT"
     if regime == "COMPRESSION" and trend != "NO_TREND" and pattern != "COMPRESSION_BREAKOUT":
+        if _is_reversal_pattern(pattern):
+            return None
         return "INVALID_MARKET_CONTEXT"
     return None
 
 
-def apply_context_multiplier(confidence, direction, trend, regime):
+def apply_context_multiplier(confidence, direction, trend, regime, pattern: str = "NONE"):
     mult = 1.0
 
-    if direction == "LONG" and trend == "TREND_UP":
-        mult *= 1.3
-    elif direction == "LONG" and trend == "TREND_DOWN":
-        mult *= 0.5
-    elif direction == "SHORT" and trend == "TREND_DOWN":
-        mult *= 1.3
-    elif direction == "SHORT" and trend == "TREND_UP":
-        mult *= 0.5
+    if _is_reversal_pattern(pattern):
+        if direction == "LONG" and trend == "TREND_DOWN":
+            mult *= 1.15
+        elif direction == "LONG" and trend == "TREND_UP":
+            mult *= 0.95
+        elif direction == "SHORT" and trend == "TREND_UP":
+            mult *= 1.15
+        elif direction == "SHORT" and trend == "TREND_DOWN":
+            mult *= 0.95
+    else:
+        if direction == "LONG" and trend == "TREND_UP":
+            mult *= 1.3
+        elif direction == "LONG" and trend == "TREND_DOWN":
+            mult *= 0.5
+        elif direction == "SHORT" and trend == "TREND_DOWN":
+            mult *= 1.3
+        elif direction == "SHORT" and trend == "TREND_UP":
+            mult *= 0.5
 
     if regime == "COMPRESSION":
-        mult *= 0.6
+        if _is_reversal_pattern(pattern):
+            mult *= 1.0
+        else:
+            mult *= 0.6
     elif regime == "EXPANSION":
         mult *= 1.2
     elif regime == "RANGE":
         mult *= 0.8
 
     return min(1.0, _coerce_float(confidence) * mult)
+
+
+def _nearest_above(prices: list[float], level: float) -> float | None:
+    candidates = [price for price in prices if price > level]
+    return min(candidates) if candidates else None
+
+
+def _nearest_below(prices: list[float], level: float) -> float | None:
+    candidates = [price for price in prices if price < level]
+    return max(candidates) if candidates else None
+
+
+def _fallback_geometry_from_pattern(pattern_state: dict | None, zones: dict | None, candle_dna: dict | None) -> dict | None:
+    if not pattern_state:
+        return None
+    pattern = str(pattern_state.get("pattern", "NONE"))
+    direction = str(pattern_state.get("direction", "NEUTRAL"))
+    if pattern == "NONE" or direction == "NEUTRAL":
+        return None
+
+    current_price = _coerce_float((zones or {}).get("current_price"), 0.0)
+    if current_price <= 0:
+        return None
+
+    equal_highs = [_coerce_float(v) for v in (zones or {}).get("equal_highs", []) if _coerce_float(v) > 0]
+    swing_highs = [_coerce_float(v) for v in (zones or {}).get("swing_highs", []) if _coerce_float(v) > 0]
+    equal_lows = [_coerce_float(v) for v in (zones or {}).get("equal_lows", []) if _coerce_float(v) > 0]
+    swing_lows = [_coerce_float(v) for v in (zones or {}).get("swing_lows", []) if _coerce_float(v) > 0]
+
+    highs = sorted(set(equal_highs + swing_highs))
+    lows = sorted(set(equal_lows + swing_lows))
+    entry = current_price
+    candle_low = _coerce_float((candle_dna or {}).get("low"), 0.0)
+    candle_high = _coerce_float((candle_dna or {}).get("high"), 0.0)
+    min_risk = max(entry * 0.002, 1.0)
+
+    if direction == "LONG":
+        sl_anchor = _nearest_below(lows, entry)
+        sl = (sl_anchor - (entry * 0.0003)) if sl_anchor is not None else (candle_low - min_risk if candle_low > 0 else entry - min_risk)
+        if sl >= entry:
+            sl = entry - min_risk
+        risk = entry - sl
+        reward = max(risk * 1.5, entry * 0.001)
+        tp_candidates = [price for price in highs if price >= entry + reward]
+        tp1 = min(tp_candidates) if tp_candidates else entry + reward
+        tp2 = max(tp1, entry + (risk * 2.0))
+    else:
+        sl_anchor = _nearest_above(highs, entry)
+        sl = (sl_anchor + (entry * 0.0003)) if sl_anchor is not None else (candle_high + min_risk if candle_high > 0 else entry + min_risk)
+        if sl <= entry:
+            sl = entry + min_risk
+        risk = sl - entry
+        reward = max(risk * 1.5, entry * 0.001)
+        tp_candidates = [price for price in lows if price <= entry - reward]
+        tp1 = max(tp_candidates) if tp_candidates else entry - reward
+        tp2 = min(tp1, entry - (risk * 2.0))
+
+    if risk <= 0:
+        return None
+
+    return {
+        "timestamp_ms": int(time.time() * 1000),
+        "pattern": pattern,
+        "base_pattern": pattern,
+        "timeframe": str(pattern_state.get("timeframe", "1m")),
+        "direction": direction,
+        "entry": round(entry, 2),
+        "sl": round(sl, 2),
+        "tp1": round(tp1, 2),
+        "tp2": round(tp2, 2),
+        "rr": round(abs(tp1 - entry) / risk, 3),
+        "current_price": round(current_price, 2),
+        "confidence": round(_coerce_float(pattern_state.get("confidence", 0.0)), 4),
+        "pattern_reason": str(pattern_state.get("pattern_reason", "")),
+        "entry_reason": "decision_gate_pattern_fallback",
+        "sl_reason": "decision_gate_liquidity_fallback",
+        "tp_reason": "decision_gate_rr_fallback",
+        "analysis": {
+            "fallback_source": "latest_pattern",
+        },
+    }
 
 
 def _load_suppressed_state() -> dict:
@@ -140,7 +254,7 @@ def _find_suppressed_entry(
     for item in suppressed_state.get("suppressed", []):
         if item.get("combo_key") == combo_key:
             return item
-        if item.get("summary_key") == summary_key:
+        if item.get("summary_key") == summary_key and item.get("trend") == trend:
             return item
         if item.get("pattern") == pattern and item.get("trend") == trend and item.get("status") == "SUPPRESSED":
             return item
@@ -190,14 +304,25 @@ def _make_decision(
     latest_score: dict | None,
     micro_event: dict | None,
     candle_dna: dict | None,
+    pattern_state: dict | None = None,
+    zones: dict | None = None,
 ) -> dict:
     now_ms = int(time.time() * 1000)
+    used_pattern_fallback = False
+    if (
+        geometry.get("pattern", "NONE") == "NONE"
+        and (geometry.get("reason") == "NO_STRUCTURAL_GEOMETRY" or geometry.get("entry") is None)
+    ):
+        fallback_geometry = _fallback_geometry_from_pattern(pattern_state, zones, candle_dna)
+        if fallback_geometry:
+            geometry = fallback_geometry
+            used_pattern_fallback = True
     pattern = geometry.get("pattern", "NONE")
     direction = geometry.get("direction", "NEUTRAL")
     confidence = _coerce_float(geometry.get("confidence", 0.0))
     trend_dir = trend.get("trend", "NO_TREND") if trend else "NO_TREND"
     regime_type = regime.get("regime", "UNKNOWN") if regime else "UNKNOWN"
-    context_adjusted_confidence = apply_context_multiplier(confidence, direction, trend_dir, regime_type)
+    context_adjusted_confidence = apply_context_multiplier(confidence, direction, trend_dir, regime_type, pattern)
     decision = _base_decision(now_ms, pattern, direction, confidence, context_adjusted_confidence)
 
     timeframe = str(geometry.get("timeframe", "1m"))
@@ -230,36 +355,37 @@ def _make_decision(
         })
         return decision
 
-    suppressed_entry = _find_suppressed_entry(
-        suppressed_state,
-        combo_key,
-        pattern,
-        session,
-        trend_dir,
-        regime_type,
-    )
-    if suppressed_entry:
-        decision.update({
-            "decision": "BLOCKED",
-            "reason": "COMBINATION_SUPPRESSED",
-            "tags": ["suppressed"],
-        })
-        return decision
+    if not used_pattern_fallback:
+        suppressed_entry = _find_suppressed_entry(
+            suppressed_state,
+            combo_key,
+            pattern,
+            session,
+            trend_dir,
+            regime_type,
+        )
+        if suppressed_entry:
+            decision.update({
+                "decision": "BLOCKED",
+                "reason": "COMBINATION_SUPPRESSED",
+                "tags": ["suppressed"],
+            })
+            return decision
 
-    context_block_reason = _context_block_reason(pattern, session, trend_dir, regime_type)
-    if context_block_reason:
-        decision.update({
-            "decision": "BLOCKED",
-            "reason": context_block_reason,
-        })
-        return decision
+        context_block_reason = _context_block_reason(pattern, session, trend_dir, regime_type)
+        if context_block_reason:
+            decision.update({
+                "decision": "BLOCKED",
+                "reason": context_block_reason,
+            })
+            return decision
 
-    if context_adjusted_confidence < 0.3:
-        decision.update({
-            "decision": "BLOCKED",
-            "reason": "LOW_CONTEXT_CONFIDENCE",
-        })
-        return decision
+        if context_adjusted_confidence < 0.3:
+            decision.update({
+                "decision": "BLOCKED",
+                "reason": "LOW_CONTEXT_CONFIDENCE",
+            })
+            return decision
 
     observer_score = _coerce_float((latest_score or {}).get("score"))
     delta_at_entry = _coerce_float((latest_score or {}).get("delta"))
@@ -308,6 +434,8 @@ def _make_decision(
         "lineage_chain": lineage_chain,
         "current_price": geometry.get("current_price"),
     })
+    if used_pattern_fallback:
+        decision["tags"] = decision.get("tags", []) + ["geometry_fallback"]
     return decision
 
 
@@ -316,8 +444,10 @@ async def run_decision_gate() -> None:
     while True:
         try:
             geometry = _load_json(config.GEOMETRY_FILE) or {}
+            pattern_state = _load_json(config.PATTERN_FILE)
             trend = _load_json(config.TREND_FILE)
             regime = _load_json(config.REGIME_FILE)
+            zones = _load_json(config.ZONES_FILE)
             suppressed_state = _load_suppressed_state()
             latest_score = _read_last_jsonl_record(config.SCORES_FILE)
             micro_event = _load_json(config.MICRO_EVENT_FILE)
@@ -331,6 +461,8 @@ async def run_decision_gate() -> None:
                 latest_score,
                 micro_event,
                 candle_dna,
+                pattern_state,
+                zones,
             )
 
             tmp = config.DECISION_FILE.with_suffix(".tmp")
