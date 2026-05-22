@@ -127,6 +127,7 @@ def _default_close_reason(result: str) -> str:
         "TP2_HIT": "tp2_target_hit",
         "TIMEOUT": "timeout_no_target_hit",
         "THESIS_BROKEN": "thesis_broken",
+        "EMERGENCY_ADVERSE_MOVE": "emergency_adverse_move",
     }
     return mapping.get(result, result.lower() if result else "")
 
@@ -421,6 +422,22 @@ def _check_thesis_broken(trade: dict, current_candle_dna: dict | None) -> bool:
     return False
 
 
+def _check_emergency_adverse_move(trade: dict, price: float) -> bool:
+    direction = str(trade.get("direction", ""))
+    entry = _coerce_float(trade.get("entry"))
+    sl = _coerce_float(trade.get("sl"))
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return False
+
+    emergency_buffer = risk * 0.5
+    if direction == "LONG":
+        return price <= (sl - emergency_buffer)
+    if direction == "SHORT":
+        return price >= (sl + emergency_buffer)
+    return False
+
+
 async def _fetch_price(session: aiohttp.ClientSession) -> float | None:
     try:
         async with session.get(BOOK_TICKER_URL, timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -558,6 +575,17 @@ class PaperLifecycle:
 
             # Only evaluate price-based exits on data that arrives after the trade opens.
             if opened_at_epoch >= current_ms or elapsed_since_open_ms < MIN_EXIT_CHECK_DELAY_MS:
+                continue
+
+            if _check_emergency_adverse_move(trade, price):
+                r_multiple = (price - entry) / risk if direction == "LONG" else (entry - price) / risk
+                exits.append((
+                    trade["id"],
+                    "EMERGENCY_ADVERSE_MOVE",
+                    round(r_multiple, 4),
+                    round(price, 2),
+                    "emergency_adverse_move",
+                ))
                 continue
 
             if current_ms < exit_armed_at:

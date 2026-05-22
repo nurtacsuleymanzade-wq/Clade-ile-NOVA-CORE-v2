@@ -425,6 +425,107 @@ def test_exit_waits_until_trade_is_armed():
             assert exits == []
 
 
+def test_thesis_broken_does_not_close_before_trade_is_armed():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import PaperLifecycle
+
+            opened_at_epoch = 1_700_000_000_000
+            trade = {
+                "id": "armedtb1",
+                "pattern": "TRAP",
+                "direction": "LONG",
+                "entry": 50000.0,
+                "sl": 49850.0,
+                "tp1": 50300.0,
+                "tp2": 50600.0,
+                "rr": 2.0,
+                "opened_at_epoch": opened_at_epoch,
+                "opened_at": opened_at_epoch,
+                "min_exit_delay_seconds": 30,
+                "exit_armed_at": opened_at_epoch + 30000,
+                "context_json": "{}",
+            }
+
+            pl = PaperLifecycle.__new__(PaperLifecycle)
+            pl._last_decision_ts = 0
+
+            with patch("services.realtime.paper_lifecycle.time.time", return_value=(opened_at_epoch + 5000) / 1000):
+                exits = pl._check_exits([trade], 49940.0, {"cvd": -0.7, "body_ratio": 0.7})
+
+            assert exits == []
+
+
+def test_sl_tp_do_not_close_before_trade_is_armed():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import PaperLifecycle
+
+            opened_at_epoch = 1_700_000_000_000
+            trade = {
+                "id": "armedsl1",
+                "pattern": "TRAP",
+                "direction": "LONG",
+                "entry": 50000.0,
+                "sl": 49850.0,
+                "tp1": 50300.0,
+                "tp2": 50600.0,
+                "rr": 2.0,
+                "opened_at_epoch": opened_at_epoch,
+                "opened_at": opened_at_epoch,
+                "min_exit_delay_seconds": 30,
+                "exit_armed_at": opened_at_epoch + 30000,
+                "context_json": "{}",
+            }
+
+            pl = PaperLifecycle.__new__(PaperLifecycle)
+            pl._last_decision_ts = 0
+
+            with patch("services.realtime.paper_lifecycle.time.time", return_value=(opened_at_epoch + 5000) / 1000):
+                sl_exits = pl._check_exits([trade], 49800.0)
+            with patch("services.realtime.paper_lifecycle.time.time", return_value=(opened_at_epoch + 5000) / 1000):
+                tp_exits = pl._check_exits([trade], 50350.0)
+
+            assert sl_exits == []
+            assert tp_exits == []
+
+
+def test_emergency_adverse_move_can_close_before_trade_is_armed():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import PaperLifecycle
+
+            opened_at_epoch = 1_700_000_000_000
+            trade = {
+                "id": "armedem1",
+                "pattern": "TRAP",
+                "direction": "LONG",
+                "entry": 50000.0,
+                "sl": 49850.0,
+                "tp1": 50300.0,
+                "tp2": 50600.0,
+                "rr": 2.0,
+                "opened_at_epoch": opened_at_epoch,
+                "opened_at": opened_at_epoch,
+                "min_exit_delay_seconds": 30,
+                "exit_armed_at": opened_at_epoch + 30000,
+                "context_json": "{}",
+            }
+
+            pl = PaperLifecycle.__new__(PaperLifecycle)
+            pl._last_decision_ts = 0
+
+            with patch("services.realtime.paper_lifecycle.time.time", return_value=(opened_at_epoch + 5000) / 1000):
+                exits = pl._check_exits([trade], 49770.0)
+
+            assert len(exits) == 1
+            assert exits[0][1] == "EMERGENCY_ADVERSE_MOVE"
+            assert exits[0][4] == "emergency_adverse_move"
+
+
 def test_refresh_trade_excursions_updates_and_persists_mae_mfe():
     with tempfile.TemporaryDirectory() as tmp:
         db_path = _setup_temp_db(tmp)
