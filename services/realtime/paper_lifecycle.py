@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 BOOK_TICKER_URL = f"{config.BINANCE_REST}/api/v3/ticker/bookTicker?symbol={config.SYMBOL}"
 TIMEOUT_SECONDS = config.TRADE_TIMEOUT_HOURS * 3600
+MIN_EXIT_CHECK_DELAY_MS = 1000
 WIN_RESULTS = {"TP1_HIT", "TP2_HIT"}
 TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900}
 
@@ -491,7 +492,7 @@ class PaperLifecycle:
         current_candle_dna: dict | None = None,
     ) -> list[tuple[str, str, float, float, str]]:
         exits: list[tuple[str, str, float, float, str]] = []
-        now_ms = int(time.time() * 1000)
+        current_epoch = int(time.time() * 1000)
         for trade in trades:
             direction = trade["direction"]
             entry = _coerce_float(trade["entry"])
@@ -502,8 +503,13 @@ class PaperLifecycle:
             if opened_at_epoch <= 0:
                 opened_at_epoch = _ms_from_utc_iso(trade.get("opened_at"))
             risk = abs(entry - sl) or 1e-9
+            elapsed_since_open_ms = current_epoch - opened_at_epoch
 
-            if (now_ms - opened_at_epoch) >= TIMEOUT_SECONDS * 1000:
+            # Only evaluate price-based exits on data that arrives after the trade opens.
+            if opened_at_epoch >= current_epoch or elapsed_since_open_ms < MIN_EXIT_CHECK_DELAY_MS:
+                continue
+
+            if elapsed_since_open_ms >= TIMEOUT_SECONDS * 1000:
                 r_multiple = (price - entry) / risk if direction == "LONG" else (entry - price) / risk
                 exits.append((trade["id"], "TIMEOUT", round(r_multiple, 4), round(price, 2), "timeout_no_target_hit"))
                 continue

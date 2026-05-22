@@ -190,6 +190,67 @@ def test_closes_on_tp1_hit():
             assert exits[0][4] == "tp1_target_hit"
 
 
+def test_skips_exit_checks_in_first_second_after_open():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import PaperLifecycle
+
+            opened_at_epoch = 1_700_000_000_000
+            trade = {
+                "id": "test03",
+                "pattern": "TRAP",
+                "direction": "LONG",
+                "entry": 50000.0,
+                "sl": 49850.0,
+                "tp1": 50300.0,
+                "tp2": 50600.0,
+                "rr": 2.0,
+                "opened_at_epoch": opened_at_epoch,
+                "opened_at": opened_at_epoch,
+                "context_json": "{}",
+            }
+
+            pl = PaperLifecycle.__new__(PaperLifecycle)
+            pl._last_decision_ts = 0
+
+            with patch("services.realtime.paper_lifecycle.time.time", return_value=(opened_at_epoch + 500) / 1000):
+                exits = pl._check_exits([trade], 49800.0)
+
+            assert exits == []
+
+
+def test_allows_exit_checks_after_one_second_has_elapsed():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import PaperLifecycle
+
+            opened_at_epoch = 1_700_000_000_000
+            trade = {
+                "id": "test04",
+                "pattern": "TRAP",
+                "direction": "LONG",
+                "entry": 50000.0,
+                "sl": 49850.0,
+                "tp1": 50300.0,
+                "tp2": 50600.0,
+                "rr": 2.0,
+                "opened_at_epoch": opened_at_epoch,
+                "opened_at": opened_at_epoch,
+                "context_json": "{}",
+            }
+
+            pl = PaperLifecycle.__new__(PaperLifecycle)
+            pl._last_decision_ts = 0
+
+            with patch("services.realtime.paper_lifecycle.time.time", return_value=(opened_at_epoch + 1001) / 1000):
+                exits = pl._check_exits([trade], 49800.0)
+
+            assert len(exits) == 1
+            assert exits[0][1] == "SL_HIT"
+
+
 def test_respects_max_open_trades():
     with tempfile.TemporaryDirectory() as tmp:
         db_path = _setup_temp_db(tmp)
