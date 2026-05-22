@@ -21,6 +21,9 @@ MAX_SWING_DISTANCE_PCT = 0.008
 MIN_RISK_PCT = 0.002
 FALLBACK_SL_PCT = 0.003
 MIN_ACCEPTABLE_RR = 1.0
+NO_STRUCTURAL_GEOMETRY = "NO_STRUCTURAL_GEOMETRY"
+
+_last_geometry_skip_reason = ""
 
 ENTRY_LOGIC = {
     "STOP_HUNT_RECLAIM_LONG": {
@@ -394,6 +397,8 @@ def _compute_geometry(
     current_price: float | None,
     candle_dna: dict | None = None,
 ) -> dict | None:
+    global _last_geometry_skip_reason
+    _last_geometry_skip_reason = ""
     pattern_name = pattern.get("pattern", "NONE")
     direction = pattern.get("direction", "NEUTRAL")
     timeframe = str(pattern.get("timeframe", "1m"))
@@ -482,12 +487,20 @@ def _compute_geometry(
 
     sl, risk, sl_reason, sl_analysis = _resolve_structural_sl(entry, direction, swing_highs, swing_lows, candle_dna)
     analysis.update(sl_analysis)
+    if sl_reason == "fallback_percentage":
+        _last_geometry_skip_reason = NO_STRUCTURAL_GEOMETRY
+        logger.info("Geometry skipped: %s %s %s (sl)", pattern_name, direction, NO_STRUCTURAL_GEOMETRY)
+        return None
     tp_result = _resolve_tp(entry, sl, direction, equal_highs, equal_lows, swing_highs, swing_lows)
     if tp_result is None:
         logger.info("Geometry skipped: %s %s RR remained below %.2f", pattern_name, direction, MIN_ACCEPTABLE_RR)
         return None
     tp1, tp_reason, rr, tp_analysis = tp_result
     analysis.update(tp_analysis)
+    if tp_reason == "fallback_rr_target":
+        _last_geometry_skip_reason = NO_STRUCTURAL_GEOMETRY
+        logger.info("Geometry skipped: %s %s %s (tp)", pattern_name, direction, NO_STRUCTURAL_GEOMETRY)
+        return None
     tp2_fallback, _ = _fallback_tp_with_reason(entry, risk, direction)
     if direction == "LONG":
         tp2 = max(tp1, tp2_fallback)
@@ -560,6 +573,7 @@ async def run_geometry_engine() -> None:
                 "rr": None,
                 "current_price": current_price,
                 "confidence": float(pattern.get("confidence", 0.0)),
+                "reason": _last_geometry_skip_reason,
                 "pattern_reason": "",
                 "entry_reason": "",
                 "sl_reason": "",

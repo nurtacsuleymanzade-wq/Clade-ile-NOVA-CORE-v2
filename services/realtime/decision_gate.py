@@ -82,6 +82,22 @@ def _coerce_float(value, default: float = 0.0) -> float:
         return float(default)
 
 
+def _is_continuation_pattern(pattern: str) -> bool:
+    return pattern == "CONTINUATION" or pattern.startswith("CONTINUATION_")
+
+
+def _context_block_reason(pattern: str, session: str, trend: str, regime: str) -> str | None:
+    if _is_continuation_pattern(pattern) and (regime == "COMPRESSION" or trend == "NO_TREND"):
+        return "CONTINUATION_REQUIRES_TREND"
+    if session == "OFF_SESSION" and regime == "COMPRESSION":
+        return "LOW_QUALITY_SESSION_CONTEXT"
+    if regime == "COMPRESSION" and trend == "NO_TREND":
+        return "INVALID_MARKET_CONTEXT"
+    if regime == "COMPRESSION" and trend != "NO_TREND" and pattern != "COMPRESSION_BREAKOUT":
+        return "INVALID_MARKET_CONTEXT"
+    return None
+
+
 def apply_context_multiplier(confidence, direction, trend, regime):
     mult = 1.0
 
@@ -227,6 +243,14 @@ def _make_decision(
             "decision": "BLOCKED",
             "reason": "COMBINATION_SUPPRESSED",
             "tags": ["suppressed"],
+        })
+        return decision
+
+    context_block_reason = _context_block_reason(pattern, session, trend_dir, regime_type)
+    if context_block_reason:
+        decision.update({
+            "decision": "BLOCKED",
+            "reason": context_block_reason,
         })
         return decision
 

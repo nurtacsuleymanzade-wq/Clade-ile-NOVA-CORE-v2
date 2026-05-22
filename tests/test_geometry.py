@@ -48,49 +48,53 @@ def test_sl_above_sweep_high_for_short():
 
 def test_tp_at_nearest_zone_level_long():
     pattern = {"pattern": "ABSORPTION", "direction": "LONG", "confidence": 0.7}
-    zones = make_zones(lows=[49800.0], highs=[50300.0, 51000.0], price=50000.0)
-    zones["swing_lows"] = [49800.0]
+    zones = make_zones(lows=[49700.0], highs=[50300.0, 51000.0], price=50000.0)
+    zones["swing_lows"] = [49600.0]
     zones["swing_highs"] = [50450.0, 51000.0]
     geo = compute_geometry_from_data(pattern, zones, 50000.0)
     assert geo is not None
-    # TP1 should be the nearest high above entry
     assert geo["tp1"] <= geo["tp2"], "TP1 should be <= TP2"
     assert geo["tp1"] > geo["entry"], "TP1 should be above entry for LONG"
     assert geo["pattern_reason"]
-    assert geo["tp_reason"] in {"equal_high_structural", "swing_high_structural"}
+    assert geo["sl_reason"] == "swing_low_structural"
+    assert geo["tp_reason"] == "equal_high_structural"
+    assert geo["tp1"] == 50300.0
 
 
 def test_tp_at_nearest_zone_level_short():
     pattern = {"pattern": "ABSORPTION", "direction": "SHORT", "confidence": 0.7}
-    zones = make_zones(highs=[50200.0], lows=[49700.0, 49200.0], price=50000.0)
-    zones["swing_highs"] = [50200.0]
+    zones = make_zones(highs=[50300.0], lows=[49700.0, 49200.0], price=50000.0)
+    zones["swing_highs"] = [50400.0]
     zones["swing_lows"] = [49700.0, 49200.0]
     geo = compute_geometry_from_data(pattern, zones, 50000.0)
     assert geo is not None
     assert geo["tp1"] >= geo["tp2"], "TP1 should be >= TP2 for SHORT"
     assert geo["tp1"] < geo["entry"], "TP1 should be below entry for SHORT"
+    assert geo["sl_reason"] == "swing_high_structural"
+    assert geo["tp_reason"] == "equal_low_structural"
+    assert geo["tp1"] == 49700.0
 
 
 def test_rr_computed_correctly():
     pattern = {"pattern": "STOP_HUNT", "direction": "LONG", "confidence": 0.75}
-    zones = make_zones(lows=[49500.0], highs=[50500.0, 51000.0], price=50000.0)
+    zones = make_zones(lows=[49900.0], highs=[50500.0, 51000.0], price=50000.0)
     zones["swing_lows"] = [49800.0]
     zones["swing_highs"] = [50500.0, 51000.0]
     geo = compute_geometry_from_data(pattern, zones, 50000.0)
     assert geo is not None
+    assert geo["sl_reason"] == "swing_low_structural"
+    assert geo["tp_reason"] == "equal_high_structural"
     expected_rr = abs(geo["tp1"] - geo["entry"]) / abs(geo["entry"] - geo["sl"])
     assert abs(geo["rr"] - expected_rr) < 0.01, f"RR mismatch: {geo['rr']} vs {expected_rr}"
 
 
-def test_uses_fallback_tp_when_structural_rr_is_too_low():
+def test_returns_none_when_structural_geometry_is_missing():
     pattern = {"pattern": "STOP_HUNT", "direction": "LONG", "confidence": 0.75}
     zones = make_zones(lows=[49950.0], highs=[50020.0], price=50000.0)
     zones["swing_lows"] = [49950.0]
     zones["swing_highs"] = [50020.0]
     geo = compute_geometry_from_data(pattern, zones, 50000.0)
-    assert geo is not None
-    assert geo["tp_reason"] == "fallback_rr_target"
-    assert geo["rr"] >= 1.0
+    assert geo is None
 
 
 def test_returns_none_for_none_pattern():

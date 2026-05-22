@@ -14,7 +14,7 @@ def test_apply_context_multiplier_boosts_trend_alignment():
 
 def test_blocks_low_context_confidence():
     geometry = {
-        "pattern": "CONTINUATION_LONG",
+        "pattern": "STOP_HUNT_RECLAIM_LONG",
         "direction": "LONG",
         "timeframe": "1m",
         "entry": 50000.0,
@@ -23,13 +23,13 @@ def test_blocks_low_context_confidence():
         "tp2": 50400.0,
         "rr": 2.0,
         "confidence": 0.45,
-        "pattern_reason": "trend_pullback_then_cvd_recovery",
-        "entry_reason": "cvd_back_with_trend",
-        "sl_reason": "below_pullback_low",
-        "tp_reason": "next_swing_high_target",
+        "pattern_reason": "wick_sweep_and_reclaim",
+        "entry_reason": "reclaim_after_sweep_low",
+        "sl_reason": "below_sweep_low_invalidation",
+        "tp_reason": "nearest_equal_high_liquidity",
     }
     trend = {"trend": "TREND_DOWN", "swing_highs_count": 3, "swing_lows_count": 3}
-    regime = {"regime": "COMPRESSION", "atr": 10.0, "delta_consistency": 0.5}
+    regime = {"regime": "RANGE", "atr": 10.0, "delta_consistency": 0.5}
     latest_score = {"score": 3.2, "delta": 1.2, "imbalance": 0.1}
     micro_event = {"event_type": "PRESSURE_BUILDING_LONG"}
     candle_dna = {"cvd": 4.5, "body_ratio": 0.4}
