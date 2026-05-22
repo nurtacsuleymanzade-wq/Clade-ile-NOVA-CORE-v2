@@ -66,6 +66,8 @@ CLOSED_EXTRA_SCHEMA = [
 
 OPEN_TRADE_COLUMNS = [name for name, _, _ in OPEN_TRADE_SCHEMA]
 CLOSED_TRADE_COLUMNS = OPEN_TRADE_COLUMNS + [name for name, _, _ in CLOSED_EXTRA_SCHEMA]
+# Backward-compatible alias for callers still referencing the pre-split name.
+TRADE_COLUMNS = OPEN_TRADE_COLUMNS
 
 
 def _load_json(path: Path) -> dict | None:
