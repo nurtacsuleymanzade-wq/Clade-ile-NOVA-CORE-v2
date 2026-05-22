@@ -92,8 +92,17 @@ def _detect_pattern(
     atr = regime.get("atr", 5.0) if regime else 5.0
     vol_avg = regime.get("volume_avg", 0.01) if regime else 0.01
 
+    dominant_wick = max(upper_wick, lower_wick)
+    wick_imbalance = dominant_wick >= max(0.35, body_ratio * 2)
+    strong_cvd = abs(cvd) >= 0.1
+    cvd_direction = "LONG" if cvd > 0 else "SHORT"
+
     # COMPRESSION
-    if regime_type == "COMPRESSION" and abs(cvd) < 0.01 and volume < vol_avg * 0.7:
+    if (
+        regime_type == "COMPRESSION"
+        and abs(cvd) < 0.03
+        and (volume < vol_avg * 0.9 or body_ratio < 0.2)
+    ):
         return {**base, "pattern": "COMPRESSION", "direction": "NEUTRAL",
                 "confidence": 0.7, "details": {"regime": regime_type}}
 
@@ -104,24 +113,26 @@ def _detect_pattern(
                 "confidence": 0.75, "details": {"regime": regime_type, "cvd": cvd}}
 
     # ABSORPTION
-    if absorption > 0.4 and volume > vol_avg * 1.2 and displacement < 1.5:
+    if absorption > 0.35 and volume > vol_avg * 1.1 and displacement < 1.8:
         direction = "LONG" if cvd > 0 else "SHORT"
         return {**base, "pattern": "ABSORPTION", "direction": direction,
                 "confidence": 0.72, "details": {"absorption": absorption, "volume": volume}}
 
     # STOP_HUNT: spike + fast return + CVD reversal
-    spike = upper_wick > 0.4 or lower_wick > 0.4
+    spike = upper_wick > 0.4 or lower_wick > 0.4 or wick_imbalance
     cvd_reversed = (cvd > 0 and prev_cvd < 0) or (cvd < 0 and prev_cvd > 0)
-    if spike and cvd_reversed and body_ratio < 0.3:
+    if spike and body_ratio < 0.3 and (cvd_reversed or wick_imbalance):
         direction = "LONG" if lower_wick > upper_wick else "SHORT"
+        confidence = 0.78 if cvd_reversed else 0.67
         return {**base, "pattern": "STOP_HUNT", "direction": direction,
-                "confidence": 0.78, "details": {"upper_wick": upper_wick, "lower_wick": lower_wick}}
+                "confidence": confidence, "details": {"upper_wick": upper_wick, "lower_wick": lower_wick}}
 
     # TRAP: price crossed level + fast return + delta flipped
-    if trapped and cvd_reversed and body_ratio < 0.25:
+    trap_like = trapped or (body_ratio < 0.18 and dominant_wick > 0.55 and strong_cvd)
+    if trap_like and (cvd_reversed or strong_cvd) and body_ratio < 0.25:
         direction = "SHORT" if open_s > close_s else "LONG"
         return {**base, "pattern": "TRAP", "direction": direction,
-                "confidence": 0.74, "details": {"trapped": True, "cvd_reversed": True}}
+                "confidence": 0.74, "details": {"trapped": trap_like, "cvd_reversed": cvd_reversed}}
 
     # REVERSAL: CVD divergence + delta weakening
     cvd_divergence = (cvd < 0 and close_s > open_s) or (cvd > 0 and close_s < open_s)
@@ -139,7 +150,23 @@ def _detect_pattern(
         return {**base, "pattern": "CONTINUATION", "direction": direction,
                 "confidence": 0.65, "details": {"trend_aligned": True, "low_vol_pullback": True}}
 
-    return base
+    # Fallback: always emit the strongest visible candle signal instead of NONE.
+    if body_ratio < 0.2:
+        direction = cvd_direction if strong_cvd else "NEUTRAL"
+        return {**base, "pattern": "COMPRESSION", "direction": direction,
+                "confidence": 0.55, "details": {"body_ratio": body_ratio, "fallback": True}}
+
+    if spike:
+        direction = "LONG" if lower_wick > upper_wick else "SHORT"
+        return {**base, "pattern": "STOP_HUNT", "direction": direction,
+                "confidence": 0.52, "details": {"upper_wick": upper_wick, "lower_wick": lower_wick, "fallback": True}}
+
+    if strong_cvd:
+        return {**base, "pattern": "CONTINUATION", "direction": cvd_direction,
+                "confidence": 0.51, "details": {"cvd": cvd, "fallback": True}}
+
+    return {**base, "pattern": "REVERSAL", "direction": cvd_direction if strong_cvd else event_dir,
+            "confidence": 0.5, "details": {"fallback": True}}
 
 
 async def run_pattern_engine() -> None:

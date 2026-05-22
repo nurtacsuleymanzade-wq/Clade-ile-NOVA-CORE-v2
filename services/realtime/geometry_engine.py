@@ -116,6 +116,17 @@ def _derive_pattern_reason(pattern: dict, logic_key: str) -> str:
     return PATTERN_REASON_DEFAULTS.get(logic_key, f"{logic_key.lower()}_detected")
 
 
+def _fallback_tp(entry: float, sl: float, direction: str) -> tuple[float, float]:
+    risk = abs(entry - sl)
+    if direction == "LONG":
+        tp1 = entry + (risk * 1.5)
+        tp2 = entry + (risk * 2.0)
+    else:
+        tp1 = entry - (risk * 1.5)
+        tp2 = entry - (risk * 2.0)
+    return tp1, tp2
+
+
 def _build_generic_geometry(
     pattern_name: str,
     direction: str,
@@ -132,19 +143,25 @@ def _build_generic_geometry(
     if direction == "LONG":
         sl_anchor = _nearest_below(lows, entry) or (min(lows) if lows else None)
         tp1 = _nearest_above(highs, entry)
-        tp2 = _nearest_above(highs, tp1) if tp1 is not None else None
-        if sl_anchor is None or tp1 is None:
+        if sl_anchor is None:
             return None
         sl = sl_anchor - buffer
+        if tp1 is None:
+            tp1, tp2 = _fallback_tp(entry, sl, direction)
+        else:
+            tp2 = _nearest_above(highs, tp1)
         if tp2 is None:
             tp2 = tp1 + max(buffer, abs(tp1 - entry) * 0.5)
     else:
         sl_anchor = _nearest_above(highs, entry) or (max(highs) if highs else None)
         tp1 = _nearest_below(lows, entry)
-        tp2 = _nearest_below(lows, tp1) if tp1 is not None else None
-        if sl_anchor is None or tp1 is None:
+        if sl_anchor is None:
             return None
         sl = sl_anchor + buffer
+        if tp1 is None:
+            tp1, tp2 = _fallback_tp(entry, sl, direction)
+        else:
+            tp2 = _nearest_below(lows, tp1)
         if tp2 is None:
             tp2 = tp1 - max(buffer, abs(entry - tp1) * 0.5)
 
@@ -226,13 +243,16 @@ def _compute_geometry(
             return None
         entry = sweep_low + (buffer * 2)
         tp1 = _nearest_above(equal_highs, entry) or _nearest_above(swing_highs, entry)
-        if tp1 is None:
-            return None
         sl = sweep_low - buffer
-        tp2 = _nearest_above(equal_highs + swing_highs, tp1) or (tp1 + abs(tp1 - entry))
+        if tp1 is None:
+            tp1, tp2 = _fallback_tp(entry, sl, direction)
+            tp_reason = "fallback_rr_target"
+            analysis.update({"fallback_tp": True})
+        else:
+            tp2 = _nearest_above(equal_highs + swing_highs, tp1) or (tp1 + abs(tp1 - entry))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = ENTRY_LOGIC[logic_key]["tp_reason"]
+        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
         analysis.update({"sweep_low": round(sweep_low, 2), "target_liquidity": round(tp1, 2)})
         pattern_name = logic_key
     elif logic_key == "STOP_HUNT_RECLAIM_SHORT":
@@ -241,39 +261,52 @@ def _compute_geometry(
             return None
         entry = sweep_high - (buffer * 2)
         tp1 = _nearest_below(equal_lows, entry) or _nearest_below(swing_lows, entry)
-        if tp1 is None:
-            return None
         sl = sweep_high + buffer
-        tp2 = _nearest_below(equal_lows + swing_lows, tp1) or (tp1 - abs(entry - tp1))
+        if tp1 is None:
+            tp1, tp2 = _fallback_tp(entry, sl, direction)
+            tp_reason = "fallback_rr_target"
+            analysis.update({"fallback_tp": True})
+        else:
+            tp2 = _nearest_below(equal_lows + swing_lows, tp1) or (tp1 - abs(entry - tp1))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = ENTRY_LOGIC[logic_key]["tp_reason"]
+        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
         analysis.update({"sweep_high": round(sweep_high, 2), "target_liquidity": round(tp1, 2)})
         pattern_name = logic_key
     elif logic_key == "CONTINUATION_LONG":
         pullback_low = _nearest_below(swing_lows + equal_lows, current_price)
         tp1 = _nearest_above(swing_highs, current_price) or _nearest_above(equal_highs, current_price)
-        if pullback_low is None or tp1 is None:
+        if pullback_low is None:
             return None
         entry = current_price
         sl = pullback_low - buffer
-        tp2 = _nearest_above(swing_highs + equal_highs, tp1) or (tp1 + abs(tp1 - entry))
+        if tp1 is None:
+            tp1, tp2 = _fallback_tp(entry, sl, direction)
+            tp_reason = "fallback_rr_target"
+            analysis.update({"fallback_tp": True})
+        else:
+            tp2 = _nearest_above(swing_highs + equal_highs, tp1) or (tp1 + abs(tp1 - entry))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = ENTRY_LOGIC[logic_key]["tp_reason"]
+        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
         analysis.update({"pullback_low": round(pullback_low, 2), "trend_target": round(tp1, 2)})
         pattern_name = logic_key
     elif logic_key == "CONTINUATION_SHORT":
         pullback_high = _nearest_above(swing_highs + equal_highs, current_price)
         tp1 = _nearest_below(swing_lows, current_price) or _nearest_below(equal_lows, current_price)
-        if pullback_high is None or tp1 is None:
+        if pullback_high is None:
             return None
         entry = current_price
         sl = pullback_high + buffer
-        tp2 = _nearest_below(swing_lows + equal_lows, tp1) or (tp1 - abs(entry - tp1))
+        if tp1 is None:
+            tp1, tp2 = _fallback_tp(entry, sl, direction)
+            tp_reason = "fallback_rr_target"
+            analysis.update({"fallback_tp": True})
+        else:
+            tp2 = _nearest_below(swing_lows + equal_lows, tp1) or (tp1 - abs(entry - tp1))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = ENTRY_LOGIC[logic_key]["tp_reason"]
+        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
         analysis.update({"pullback_high": round(pullback_high, 2), "trend_target": round(tp1, 2)})
         pattern_name = logic_key
     elif logic_key == "ABSORPTION_REVERSAL_LONG":
@@ -282,13 +315,16 @@ def _compute_geometry(
             return None
         entry = absorption_low + (buffer * 2)
         tp1 = _nearest_above(equal_highs + swing_highs, entry)
-        if tp1 is None:
-            return None
         sl = absorption_low - buffer
-        tp2 = _nearest_above(equal_highs + swing_highs, tp1) or (tp1 + abs(tp1 - entry))
+        if tp1 is None:
+            tp1, tp2 = _fallback_tp(entry, sl, direction)
+            tp_reason = "fallback_rr_target"
+            analysis.update({"fallback_tp": True})
+        else:
+            tp2 = _nearest_above(equal_highs + swing_highs, tp1) or (tp1 + abs(tp1 - entry))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = ENTRY_LOGIC[logic_key]["tp_reason"]
+        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
         analysis.update({"absorption_low": round(absorption_low, 2), "resistance_target": round(tp1, 2)})
         pattern_name = logic_key
     elif logic_key == "ABSORPTION_REVERSAL_SHORT":
@@ -297,13 +333,16 @@ def _compute_geometry(
             return None
         entry = absorption_high - (buffer * 2)
         tp1 = _nearest_below(equal_lows + swing_lows, entry)
-        if tp1 is None:
-            return None
         sl = absorption_high + buffer
-        tp2 = _nearest_below(equal_lows + swing_lows, tp1) or (tp1 - abs(entry - tp1))
+        if tp1 is None:
+            tp1, tp2 = _fallback_tp(entry, sl, direction)
+            tp_reason = "fallback_rr_target"
+            analysis.update({"fallback_tp": True})
+        else:
+            tp2 = _nearest_below(equal_lows + swing_lows, tp1) or (tp1 - abs(entry - tp1))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
         sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = ENTRY_LOGIC[logic_key]["tp_reason"]
+        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
         analysis.update({"absorption_high": round(absorption_high, 2), "support_target": round(tp1, 2)})
         pattern_name = logic_key
     else:

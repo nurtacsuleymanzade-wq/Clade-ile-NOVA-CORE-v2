@@ -42,6 +42,12 @@ def _summary_key(entry: dict) -> str:
     return f"{entry.get('pattern', '')}|{entry.get('session', '')}|{entry.get('regime', '')}"
 
 
+def _is_contextual_combo_key(key: str) -> bool:
+    parts = set(key.split("|"))
+    required_prefixes = ("pattern:", "trend:", "regime:", "session:")
+    return all(any(part.startswith(prefix) for part in parts) for prefix in required_prefixes)
+
+
 def _evaluate_matrix(matrix: dict) -> tuple[list[str], list[str], list[str]]:
     """Compatibility wrapper for legacy tests expecting key lists."""
     sample_building: list[str] = []
@@ -49,6 +55,8 @@ def _evaluate_matrix(matrix: dict) -> tuple[list[str], list[str], list[str]]:
     suppressed: list[str] = []
 
     for key, stats in matrix.items():
+        if not _is_contextual_combo_key(key):
+            continue
         sample_count = stats.get("sample_count", 0)
         expectancy = stats.get("expectancy", 0.0)
         status, _, _ = evaluate_combo_status(sample_count, expectancy)
