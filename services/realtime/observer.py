@@ -29,6 +29,7 @@ class Observer:
         self._agg_trades: deque = deque(maxlen=500)
         self._book_ticker: dict = {}
         self._depth_updates: deque = deque(maxlen=200)
+        self._last_trade_price: float | None = None
         self._last_score_ts: int = 0
         self._running = False
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -37,8 +38,10 @@ class Observer:
         return int(time.time() * 1000)
 
     def _handle_agg_trade(self, msg: dict) -> None:
+        price = float(msg["p"])
+        self._last_trade_price = price
         self._agg_trades.append({
-            "price": float(msg["p"]),
+            "price": price,
             "qty": float(msg["q"]),
             "is_buyer_maker": msg["m"],
             "ts": msg["T"],
@@ -51,6 +54,17 @@ class Observer:
             "bid_qty": float(msg["B"]),
             "ask_qty": float(msg["A"]),
         }
+
+    def _resolve_price(self, recent_trades: list[dict]) -> float | None:
+        bid = self._book_ticker.get("bid")
+        ask = self._book_ticker.get("ask")
+        if bid is not None and ask is not None:
+            return (float(bid) + float(ask)) / 2.0
+        if recent_trades:
+            return float(recent_trades[-1]["price"])
+        if self._last_trade_price is not None:
+            return float(self._last_trade_price)
+        return None
 
     def _handle_depth(self, msg: dict) -> None:
         self._depth_updates.append({
@@ -147,11 +161,13 @@ class Observer:
         score = max(-10.0, min(10.0, raw / max_possible * 10.0))
 
         dominant = "LONG" if score > 0 else ("SHORT" if score < 0 else "NEUTRAL")
+        price = self._resolve_price(recent_trades)
 
         return {
             "timestamp_ms": now_ms,
             "score": round(score, 4),
             "dominant": dominant,
+            "price": round(price, 2) if price is not None else None,
             "delta": round(delta, 6),
             "imbalance": round(imbalance, 4),
             "absorption": round(absorption, 4),

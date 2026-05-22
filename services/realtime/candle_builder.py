@@ -44,6 +44,7 @@ def _build_candle_dna(records: list[dict], candle_start_ms: int) -> dict | None:
         return None
 
     scores = [r["score"] for r in records]
+    prices = [float(r["price"]) for r in records if r.get("price") is not None]
     deltas = [r.get("delta", 0.0) for r in records]
     absorptions = [r.get("absorption", 0.0) for r in records]
     large_lots = [r.get("large_lot", False) for r in records]
@@ -52,6 +53,10 @@ def _build_candle_dna(records: list[dict], candle_start_ms: int) -> dict | None:
     close_s = scores[-1]
     high_s = max(scores)
     low_s = min(scores)
+    open_p = prices[0] if prices else None
+    close_p = prices[-1] if prices else None
+    high_p = max(prices) if prices else None
+    low_p = min(prices) if prices else None
 
     body = close_s - open_s
     total_range = high_s - low_s or 1e-9
@@ -76,6 +81,10 @@ def _build_candle_dna(records: list[dict], candle_start_ms: int) -> dict | None:
     n = len(records)
     return {
         "timestamp_ms": candle_start_ms,
+        "open": round(open_p, 2) if open_p is not None else None,
+        "high": round(high_p, 2) if high_p is not None else None,
+        "low": round(low_p, 2) if low_p is not None else None,
+        "close": round(close_p, 2) if close_p is not None else None,
         "open_score": round(open_s, 4),
         "close_score": round(close_s, 4),
         "high_score": round(high_s, 4),
