@@ -41,14 +41,22 @@ def _read_last_candles(n: int = 200) -> list[dict]:
     return candles
 
 
-def _price_from_score(score: float, mid: float) -> float:
-    return mid * (1 + score / 10000)
+def _price_from_score(value: float, mid: float) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = 0.0
+    if numeric > 1000:
+        return numeric
+    if -10 <= numeric <= 10:
+        return mid * (1 + numeric / 10000)
+    return numeric
 
 
 def _detect_equal_highs(candles: list[dict], mid_price: float) -> list[dict]:
     if not candles:
         return []
-    highs = [_price_from_score(c.get("high_score", c.get("close_score", 0)), mid_price) for c in candles]
+    highs = [_price_from_score(c.get("high", c.get("high_score", 0)), mid_price) for c in candles]
     zones = []
     n = len(highs)
     checked = [False] * n
@@ -75,7 +83,7 @@ def _detect_equal_highs(candles: list[dict], mid_price: float) -> list[dict]:
 def _detect_equal_lows(candles: list[dict], mid_price: float) -> list[dict]:
     if not candles:
         return []
-    lows = [_price_from_score(c.get("low_score", c.get("open_score", 0)), mid_price) for c in candles]
+    lows = [_price_from_score(c.get("low", c.get("low_score", 0)), mid_price) for c in candles]
     zones = []
     n = len(lows)
     checked = [False] * n
@@ -102,7 +110,7 @@ def _detect_equal_lows(candles: list[dict], mid_price: float) -> list[dict]:
 def _detect_swing_highs(candles: list[dict], mid_price: float) -> list[dict]:
     if len(candles) < SWING_WINDOW * 2 + 1:
         return []
-    highs = [_price_from_score(c.get("high_score", c.get("close_score", 0)), mid_price) for c in candles]
+    highs = [_price_from_score(c.get("high", c.get("high_score", 0)), mid_price) for c in candles]
     zones = []
     w = SWING_WINDOW
     for i in range(w, len(highs) - w):
@@ -119,7 +127,7 @@ def _detect_swing_highs(candles: list[dict], mid_price: float) -> list[dict]:
 def _detect_swing_lows(candles: list[dict], mid_price: float) -> list[dict]:
     if len(candles) < SWING_WINDOW * 2 + 1:
         return []
-    lows = [_price_from_score(c.get("low_score", c.get("open_score", 0)), mid_price) for c in candles]
+    lows = [_price_from_score(c.get("low", c.get("low_score", 0)), mid_price) for c in candles]
     zones = []
     w = SWING_WINDOW
     for i in range(w, len(lows) - w):
@@ -169,18 +177,21 @@ async def run_zone_engine() -> None:
 
                 mid_price = await _fetch_mid_price(session) or 50000.0
 
-                all_zones = (
-                    _detect_equal_highs(candles, mid_price)
-                    + _detect_equal_lows(candles, mid_price)
-                    + _detect_swing_highs(candles, mid_price)
-                    + _detect_swing_lows(candles, mid_price)
-                )
+                equal_highs = _detect_equal_highs(candles, mid_price)
+                equal_lows = _detect_equal_lows(candles, mid_price)
+                swing_highs = _detect_swing_highs(candles, mid_price)
+                swing_lows = _detect_swing_lows(candles, mid_price)
+                all_zones = equal_highs + equal_lows + swing_highs + swing_lows
                 all_zones = _mark_active(all_zones, mid_price)
 
                 output = {
                     "timestamp_ms": int(time.time() * 1000),
                     "current_price": round(mid_price, 2),
                     "zone_count": len(all_zones),
+                    "equal_highs": [zone["price"] for zone in all_zones if zone["type"] == "equal_highs"],
+                    "equal_lows": [zone["price"] for zone in all_zones if zone["type"] == "equal_lows"],
+                    "swing_highs": [zone["price"] for zone in all_zones if zone["type"] == "swing_high"],
+                    "swing_lows": [zone["price"] for zone in all_zones if zone["type"] == "swing_low"],
                     "zones": all_zones,
                 }
 
