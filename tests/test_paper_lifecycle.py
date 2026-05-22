@@ -107,6 +107,7 @@ def test_trade_dna_schema_columns_exist():
             "trend_at_entry",
             "regime_at_entry",
             "opened_at",
+            "lineage_chain",
         ):
             assert required in open_columns
 
@@ -304,6 +305,7 @@ def test_open_trade_persists_trade_dna_fields():
                 "regime_at_entry": "EXPANSION",
                 "trend_reason": "swings high=4, low=3",
                 "regime_reason": "atr=10, delta_consistency=0.8",
+                "lineage_chain": "4.20 -> PRESSURE_BUILDING_LONG -> STOP_HUNT_RECLAIM_LONG -> reclaim_after_sweep_low",
                 "tags": [],
             }
             trade = pl._open_trade(decision, [])
@@ -314,3 +316,133 @@ def test_open_trade_persists_trade_dna_fields():
             assert open_trade["sl_reason"] == "below_sweep_low_invalidation"
             assert open_trade["tp_reason"] == "nearest_equal_high_liquidity"
             assert open_trade["context_adjusted_confidence"] == 0.84
+            assert open_trade["lineage_chain"] == decision["lineage_chain"]
+
+
+def test_blocks_duplicate_same_candle_same_timeframe():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import PaperLifecycle
+            pl = PaperLifecycle.__new__(PaperLifecycle)
+            pl._last_decision_ts = 0
+
+            now_ms = int(time.time() * 1000)
+            decision = {
+                "decision": "ALLOW_PAPER",
+                "timestamp_ms": now_ms,
+                "pattern": "REVERSAL",
+                "timeframe": "1m",
+                "direction": "LONG",
+                "entry": 50000.0,
+                "sl": 49850.0,
+                "tp1": 50300.0,
+                "tp2": 50600.0,
+                "rr": 2.0,
+                "tags": [],
+            }
+
+            first_trade = pl._open_trade(decision, [])
+            assert first_trade is not None
+            second_trade = pl._open_trade(decision, _get_open_trades(db_path))
+            assert second_trade is None
+            assert _get_open_count(db_path) == 1
+
+
+def test_blocks_same_pattern_direction_timeframe_during_cooldown():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import PaperLifecycle
+            pl = PaperLifecycle.__new__(PaperLifecycle)
+            pl._last_decision_ts = 0
+
+            now_ms = int(time.time() * 1000)
+            first_decision = {
+                "decision": "ALLOW_PAPER",
+                "timestamp_ms": now_ms - 120000,
+                "pattern": "REVERSAL",
+                "timeframe": "5m",
+                "direction": "LONG",
+                "entry": 50000.0,
+                "sl": 49850.0,
+                "tp1": 50300.0,
+                "tp2": 50600.0,
+                "rr": 2.0,
+                "tags": [],
+            }
+            second_decision = {
+                **first_decision,
+                "timestamp_ms": now_ms,
+            }
+
+            first_trade = pl._open_trade(first_decision, [])
+            assert first_trade is not None
+            second_trade = pl._open_trade(second_decision, _get_open_trades(db_path))
+            assert second_trade is None
+            assert _get_open_count(db_path) == 1
+
+
+def test_allows_same_pattern_on_new_candle_after_cooldown():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import PaperLifecycle
+            pl = PaperLifecycle.__new__(PaperLifecycle)
+            pl._last_decision_ts = 0
+
+            now_ms = int(time.time() * 1000)
+            first_decision = {
+                "decision": "ALLOW_PAPER",
+                "timestamp_ms": now_ms - 400000,
+                "pattern": "REVERSAL",
+                "timeframe": "5m",
+                "direction": "LONG",
+                "entry": 50000.0,
+                "sl": 49850.0,
+                "tp1": 50300.0,
+                "tp2": 50600.0,
+                "rr": 2.0,
+                "tags": [],
+            }
+            second_decision = {
+                **first_decision,
+                "timestamp_ms": now_ms,
+            }
+
+            first_trade = pl._open_trade(first_decision, [])
+            assert first_trade is not None
+            existing = _get_open_trades(db_path)
+            existing[0]["opened_at_epoch"] = now_ms - 400000
+            second_trade = pl._open_trade(second_decision, existing)
+            assert second_trade is not None
+
+
+def test_closes_trade_when_thesis_broken():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import PaperLifecycle, _insert_open_trade
+            opened_at_epoch = int(time.time() * 1000) - 60000
+            trade = {
+                "id": "broken01",
+                "pattern": "TRAP",
+                "timeframe": "1m",
+                "direction": "LONG",
+                "entry": 50000.0,
+                "sl": 49850.0,
+                "tp1": 50300.0,
+                "tp2": 50600.0,
+                "rr": 2.0,
+                "opened_at_epoch": opened_at_epoch,
+                "opened_at": opened_at_epoch,
+                "context_json": "{}",
+            }
+            _insert_open_trade(db_path, trade)
+
+            pl = PaperLifecycle.__new__(PaperLifecycle)
+            pl._last_decision_ts = 0
+            exits = pl._check_exits([trade], 49940.0, {"cvd": -0.7, "body_ratio": 0.7})
+            assert len(exits) == 1
+            assert exits[0][1] == "THESIS_BROKEN"
+            assert exits[0][4] == "thesis_broken"

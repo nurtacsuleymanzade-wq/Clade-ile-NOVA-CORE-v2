@@ -134,6 +134,7 @@ def _normalize_trade(trade: dict, table_name: str) -> dict:
         "imbalance_at_entry": _coerce_float(trade.get("imbalance_at_entry")),
         "cvd_at_entry": _coerce_float(trade.get("cvd_at_entry")),
         "body_ratio": _coerce_float(trade.get("body_ratio")),
+        "lineage_chain": str(trade.get("lineage_chain", "")),
         "session": str(trade.get("session") or _utc_session(opened_at_epoch or int(time.time() * 1000))),
         "trend_at_entry": str(trade.get("trend_at_entry", "NO_TREND")),
         "regime_at_entry": str(trade.get("regime_at_entry", "UNKNOWN")),
@@ -321,30 +322,21 @@ def _format_telegram(report: dict) -> str:
         f"Açılan: {len(report['recent_opened'])} trade",
     ]
 
-    for trade in report["recent_opened"]:
-        lines.extend([
-            f"  → {trade.get('pattern', '')} | {trade.get('timeframe', '1m')} | conf: {trade.get('context_adjusted_confidence', 0.0):.2f}",
-            f"    Sebep: {trade.get('pattern_reason', '')}",
-            f"    Entry: {_format_trade_number(trade.get('entry'))} | SL: {_format_trade_number(trade.get('sl'))} | TP1: {_format_trade_number(trade.get('tp1'))}",
-            f"    RR: {trade.get('rr', 0.0):.2f}",
-        ])
+    latest_lineage = next(
+        (trade.get("lineage_chain", "") for trade in report["recent_opened"] if trade.get("lineage_chain")),
+        "",
+    )
+    if latest_lineage:
+        lines.append(f"Zincir: {latest_lineage}")
 
+    # Son kapanan 3 trade özeti
     lines.append(f"Kapanan: {len(report['recent_closed'])} trade")
-    for trade in report["recent_closed"]:
-        lines.extend([
-            f"  {_emoji_for_result(trade.get('result', ''))} {trade.get('pattern', '')} | {trade.get('timeframe', '1m')} | {trade.get('result', '')}",
-            f"    Açılış: {trade.get('pattern_reason', '')}",
-            (
-                "    Zincir: "
-                f"{trade.get('observer_score', 0.0):.2f} → "
-                f"{trade.get('micro_event', '')} → "
-                f"{trade.get('pattern', '')} → "
-                f"{trade.get('entry_reason', '')} → "
-                f"{trade.get('result', '')}"
-            ),
-            f"    Entry: {_format_trade_number(trade.get('entry'))} → Çıkış: {_format_trade_number(trade.get('exit_price'))}",
-            f"    Süre: {max(0, trade.get('duration_seconds', 0) // 60)}dk | R: {trade.get('r_multiple', 0.0):.2f}",
-        ])
+    for trade in report["recent_closed"][:3]:
+        lines.append(
+            f"  {_emoji_for_result(trade.get('result',''))} {trade.get('pattern','')} | "
+            f"{trade.get('direction','')} | R:{trade.get('r_multiple',0.0):.2f} | "
+            f"{max(0,trade.get('duration_seconds',0)//60)}dk"
+        )
 
     general = report["general"]
     lines.extend([
@@ -466,7 +458,10 @@ async def run_reporter() -> None:
                     report["general"]["expectancy_r"],
                 )
 
-                await _send_telegram(session, report["telegram_text"])
+                text = report["telegram_text"]
+                if len(text) > 4000:
+                    text = text[:3900] + "\n\n... (kısaltıldı)"
+                await _send_telegram(session, text)
 
             except Exception as e:
                 logger.warning(f"reporter error: {e}")

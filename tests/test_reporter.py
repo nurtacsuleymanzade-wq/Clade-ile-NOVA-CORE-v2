@@ -27,6 +27,7 @@ def make_open_trade() -> dict:
         "tp_reason": "nearest_equal_high_liquidity",
         "observer_score": 4.2,
         "micro_event": "PRESSURE_BUILDING_LONG",
+        "lineage_chain": "4.20 -> PRESSURE_BUILDING_LONG -> STOP_HUNT_RECLAIM_LONG -> reclaim_after_sweep_low",
         "opened_at_epoch": now_ms,
         "session": "LONDON",
         "trend_at_entry": "TREND_UP",

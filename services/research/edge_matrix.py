@@ -21,6 +21,7 @@ ACTIVE_EXPECTANCY_THRESHOLD = 0.1
 SUPPRESS_EXPECTANCY_THRESHOLD = -0.3
 WIN_RESULTS = {"TP1_HIT", "TP2_HIT"}
 LOSS_RESULTS = {"SL_HIT"}
+THESIS_RESULTS = {"THESIS_BROKEN"}
 TIMEOUT_RESULTS = {"TIMEOUT"}
 
 
@@ -135,7 +136,10 @@ def _build_stats(key: str, group: list[dict], canonical: bool) -> dict:
     timeout_count = sum(1 for trade in group if trade.get("result") in TIMEOUT_RESULTS)
     tp_count = sum(1 for trade in edge_trades if trade.get("result") in WIN_RESULTS)
     sl_count = sum(1 for trade in edge_trades if trade.get("result") in LOSS_RESULTS)
+    thesis_broken_count = sum(1 for trade in edge_trades if trade.get("result") in THESIS_RESULTS)
     sample_count = len(edge_trades)
+    loss_like_trades = [trade for trade in edge_trades if trade.get("result") in (LOSS_RESULTS | THESIS_RESULTS)]
+    loss_like_count = len(loss_like_trades)
 
     avg_r = sum(trade.get("r_multiple", 0.0) for trade in edge_trades) / sample_count if sample_count else 0.0
     winrate = tp_count / sample_count if sample_count else 0.0
@@ -144,10 +148,10 @@ def _build_stats(key: str, group: list[dict], canonical: bool) -> dict:
         if tp_count else 0.0
     )
     avg_loss_r = (
-        abs(sum(trade.get("r_multiple", 0.0) for trade in edge_trades if trade.get("result") in LOSS_RESULTS) / sl_count)
-        if sl_count else 0.0
+        abs(sum(trade.get("r_multiple", 0.0) for trade in loss_like_trades) / loss_like_count)
+        if loss_like_count else 0.0
     )
-    expectancy = (winrate * avg_win_r) - ((sl_count / sample_count) * avg_loss_r) if sample_count else 0.0
+    expectancy = (winrate * avg_win_r) - ((loss_like_count / sample_count) * avg_loss_r) if sample_count else 0.0
     status, suppress_reason, promote_reason = evaluate_combo_status(sample_count, expectancy)
 
     exemplar = group[0] if group else {}
@@ -161,6 +165,7 @@ def _build_stats(key: str, group: list[dict], canonical: bool) -> dict:
         "sample_count": sample_count,
         "tp_count": tp_count,
         "sl_count": sl_count,
+        "thesis_broken_count": thesis_broken_count,
         "timeout_count": timeout_count,
         "winrate": round(winrate, 4),
         "avg_r": round(avg_r, 4),

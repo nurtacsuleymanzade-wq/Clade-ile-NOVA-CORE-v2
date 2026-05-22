@@ -15,6 +15,12 @@ import config
 logger = logging.getLogger(__name__)
 
 SL_BUFFER_PCT = 0.0003  # 0.03%
+STRUCTURAL_BUFFER_PCT = 0.0005
+MIN_SWING_DISTANCE_PCT = 0.001
+MAX_SWING_DISTANCE_PCT = 0.008
+MIN_RISK_PCT = 0.002
+FALLBACK_SL_PCT = 0.003
+MIN_ACCEPTABLE_RR = 1.0
 
 ENTRY_LOGIC = {
     "STOP_HUNT_RECLAIM_LONG": {
@@ -78,6 +84,22 @@ def _zone_prices(zone_list: list[dict], zone_types: tuple[str, ...]) -> list[flo
     return sorted(float(zone["price"]) for zone in zone_list if zone.get("type") in zone_types and zone.get("price") is not None)
 
 
+def _combine_zone_prices(zones: dict | None, zone_list: list[dict], array_key: str, zone_types: tuple[str, ...]) -> list[float]:
+    prices: list[float] = []
+    if zones:
+        values = zones.get(array_key, [])
+        if isinstance(values, list):
+            for value in values:
+                if isinstance(value, dict):
+                    candidate = value.get("price")
+                else:
+                    candidate = value
+                if candidate not in (None, ""):
+                    prices.append(float(candidate))
+    prices.extend(_zone_prices(zone_list, zone_types))
+    return sorted(set(prices))
+
+
 def _nearest_above(prices: list[float], level: float) -> float | None:
     candidates = [price for price in prices if price > level]
     return min(candidates) if candidates else None
@@ -128,14 +150,14 @@ def _fallback_tp(entry: float, sl: float, direction: str) -> tuple[float, float]
 
 
 def _fallback_sl(entry: float, direction: str) -> float:
-    distance = entry * 0.003
+    distance = entry * FALLBACK_SL_PCT
     if direction == "LONG":
         return entry - distance
     return entry + distance
 
 
 def _normalize_sl(entry: float, sl: float | None, direction: str) -> tuple[float, float]:
-    minimum_risk = entry * 0.002
+    minimum_risk = entry * MIN_RISK_PCT
     if sl is None:
         sl = _fallback_sl(entry, direction)
     if direction == "LONG":
@@ -156,6 +178,144 @@ def _candle_extreme(candle_dna: dict | None, key: str) -> float | None:
     return float(value)
 
 
+def _candle_buffer_sl(entry: float, direction: str, candle_dna: dict | None) -> tuple[float | None, str]:
+    candle_low = _candle_extreme(candle_dna, "low")
+    candle_high = _candle_extreme(candle_dna, "high")
+    candle_range = None
+    if candle_low is not None and candle_high is not None:
+        candle_range = candle_high - candle_low
+    buffer = (candle_range * 0.1) if candle_range and candle_range > 0 else (entry * MIN_RISK_PCT)
+
+    if direction == "LONG":
+        if candle_low is None:
+            return None, "candle_low_buffer"
+        return candle_low - buffer, "candle_low_buffer"
+
+    if candle_high is None:
+        return None, "candle_high_buffer"
+    return candle_high + buffer, "candle_high_buffer"
+
+
+def _resolve_structural_sl(
+    entry: float,
+    direction: str,
+    swing_highs: list[float],
+    swing_lows: list[float],
+    candle_dna: dict | None,
+) -> tuple[float, float, str, dict]:
+    analysis: dict = {}
+    structural_buffer = entry * STRUCTURAL_BUFFER_PCT
+    min_distance = entry * MIN_SWING_DISTANCE_PCT
+    max_distance = entry * MAX_SWING_DISTANCE_PCT
+
+    if direction == "LONG":
+        swing_low = _nearest_below(swing_lows, entry)
+        if swing_low is not None:
+            distance = entry - swing_low
+            analysis["swing_low_candidate"] = round(swing_low, 2)
+            analysis["swing_low_distance"] = round(distance, 2)
+            if min_distance < distance < max_distance:
+                sl = swing_low - structural_buffer
+                return sl, abs(entry - sl), "swing_low_structural", analysis
+        sl, sl_reason = _candle_buffer_sl(entry, direction, candle_dna)
+        if sl is not None and sl < entry:
+            return sl, abs(entry - sl), sl_reason, analysis
+        sl = _fallback_sl(entry, direction)
+        return sl, abs(entry - sl), "fallback_percentage", analysis
+
+    swing_high = _nearest_above(swing_highs, entry)
+    if swing_high is not None:
+        distance = swing_high - entry
+        analysis["swing_high_candidate"] = round(swing_high, 2)
+        analysis["swing_high_distance"] = round(distance, 2)
+        if min_distance < distance < max_distance:
+            sl = swing_high + structural_buffer
+            return sl, abs(entry - sl), "swing_high_structural", analysis
+    sl, sl_reason = _candle_buffer_sl(entry, direction, candle_dna)
+    if sl is not None and sl > entry:
+        return sl, abs(entry - sl), sl_reason, analysis
+    sl = _fallback_sl(entry, direction)
+    return sl, abs(entry - sl), "fallback_percentage", analysis
+
+
+def _tp_candidates(direction: str, entry: float, equal_highs: list[float], equal_lows: list[float], swing_highs: list[float], swing_lows: list[float]) -> list[tuple[float, str]]:
+    candidates: list[tuple[float, str]] = []
+    if direction == "LONG":
+        seen: set[tuple[float, str]] = set()
+        for price in sorted(p for p in equal_highs if p > entry):
+            item = (price, "equal_high_structural")
+            if item not in seen:
+                candidates.append(item)
+                seen.add(item)
+        for price in sorted(p for p in swing_highs if p > entry):
+            item = (price, "swing_high_structural")
+            if item not in seen:
+                candidates.append(item)
+                seen.add(item)
+        return candidates
+
+    seen = set()
+    for price in sorted((p for p in equal_lows if p < entry), reverse=True):
+        item = (price, "equal_low_structural")
+        if item not in seen:
+            candidates.append(item)
+            seen.add(item)
+    for price in sorted((p for p in swing_lows if p < entry), reverse=True):
+        item = (price, "swing_low_structural")
+        if item not in seen:
+            candidates.append(item)
+            seen.add(item)
+    return candidates
+
+
+def _fallback_tp_with_reason(entry: float, risk: float, direction: str) -> tuple[float, str]:
+    risk = max(risk, entry * MIN_RISK_PCT)
+    if direction == "LONG":
+        return entry + (risk * 1.5), "fallback_rr_target"
+    return entry - (risk * 1.5), "fallback_rr_target"
+
+
+def _resolve_tp(
+    entry: float,
+    sl: float,
+    direction: str,
+    equal_highs: list[float],
+    equal_lows: list[float],
+    swing_highs: list[float],
+    swing_lows: list[float],
+) -> tuple[float, str, float, dict] | None:
+    risk = max(abs(entry - sl), entry * MIN_RISK_PCT)
+    candidates = _tp_candidates(direction, entry, equal_highs, equal_lows, swing_highs, swing_lows)
+    analysis = {
+        "tp_candidates": [round(price, 2) for price, _ in candidates],
+        "minimum_risk_applied": round(entry * MIN_RISK_PCT, 2),
+    }
+
+    selected_tp = None
+    selected_reason = ""
+    rr = 0.0
+    for index, (candidate_tp, candidate_reason) in enumerate(candidates):
+        candidate_rr = abs(candidate_tp - entry) / risk if risk > 0 else 0.0
+        if candidate_rr >= MIN_ACCEPTABLE_RR:
+            selected_tp = candidate_tp
+            selected_reason = candidate_reason
+            rr = candidate_rr
+            analysis["tp_candidate_index"] = index
+            break
+
+    if selected_tp is None:
+        fallback_tp, fallback_reason = _fallback_tp_with_reason(entry, risk, direction)
+        fallback_rr = abs(fallback_tp - entry) / risk if risk > 0 else 0.0
+        analysis["fallback_tp"] = round(fallback_tp, 2)
+        if fallback_rr < MIN_ACCEPTABLE_RR:
+            return None
+        selected_tp = fallback_tp
+        selected_reason = fallback_reason
+        rr = fallback_rr
+
+    return selected_tp, selected_reason, rr, analysis
+
+
 def _build_generic_geometry(
     pattern_name: str,
     direction: str,
@@ -165,8 +325,8 @@ def _build_generic_geometry(
     pattern_reason: str,
     candle_dna: dict | None = None,
 ) -> dict | None:
-    highs = _zone_prices(zone_list, ("equal_highs", "swing_high"))
-    lows = _zone_prices(zone_list, ("equal_lows", "swing_low"))
+    highs = _combine_zone_prices(None, zone_list, "equal_highs", ("equal_highs", "swing_high"))
+    lows = _combine_zone_prices(None, zone_list, "equal_lows", ("equal_lows", "swing_low"))
     buffer = current_price * SL_BUFFER_PCT
     entry = current_price
 
@@ -247,153 +407,68 @@ def _compute_geometry(
     if not isinstance(zone_list, list):
         zone_list = []
 
-    equal_highs = _zone_prices(zone_list, ("equal_highs",))
-    equal_lows = _zone_prices(zone_list, ("equal_lows",))
-    swing_highs = _zone_prices(zone_list, ("swing_high",))
-    swing_lows = _zone_prices(zone_list, ("swing_low",))
+    equal_highs = _combine_zone_prices(zones, zone_list, "equal_highs", ("equal_highs",))
+    equal_lows = _combine_zone_prices(zones, zone_list, "equal_lows", ("equal_lows",))
+    swing_highs = _combine_zone_prices(zones, zone_list, "swing_highs", ("swing_high",))
+    swing_lows = _combine_zone_prices(zones, zone_list, "swing_lows", ("swing_low",))
 
     logic_key = _resolve_logic_key(pattern_name, direction)
     pattern_reason = _derive_pattern_reason(pattern, logic_key)
     confidence = float(pattern.get("confidence", 0.0))
-    buffer = current_price * SL_BUFFER_PCT
-
     entry = None
     sl = None
     tp1 = None
     tp2 = None
     entry_reason = "close_entry_default"
-    sl_reason = "candle_extreme_default"
-    tp_reason = "nearest_opposing_liquidity_default"
+    sl_reason = "fallback_percentage"
+    tp_reason = "fallback_rr_target"
     analysis = {"logic_key": logic_key}
 
     if logic_key == "STOP_HUNT_RECLAIM_LONG":
         sweep_low = _nearest_below(equal_lows + swing_lows, current_price) or (min(equal_lows + swing_lows) if (equal_lows or swing_lows) else None)
+        buffer = current_price * SL_BUFFER_PCT
         entry = sweep_low + (buffer * 2) if sweep_low is not None and current_price > sweep_low else current_price
-        tp1 = _nearest_above(equal_highs, entry) or _nearest_above(swing_highs, entry)
-        sl = (sweep_low - buffer) if sweep_low is not None else _fallback_sl(entry, direction)
-        sl, risk = _normalize_sl(entry, sl, direction)
-        if tp1 is None:
-            tp1, tp2 = _fallback_tp(entry, sl, direction)
-            tp_reason = "fallback_rr_target"
-            analysis.update({"fallback_tp": True})
-        else:
-            tp2 = _nearest_above(equal_highs + swing_highs, tp1) or (tp1 + abs(tp1 - entry))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
-        sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"sweep_low": round(sweep_low, 2) if sweep_low is not None else None, "target_liquidity": round(tp1, 2)})
+        analysis.update({"sweep_low": round(sweep_low, 2) if sweep_low is not None else None})
         pattern_name = logic_key
     elif logic_key == "STOP_HUNT_RECLAIM_SHORT":
         sweep_high = _nearest_above(equal_highs + swing_highs, current_price) or (max(equal_highs + swing_highs) if (equal_highs or swing_highs) else None)
+        buffer = current_price * SL_BUFFER_PCT
         entry = sweep_high - (buffer * 2) if sweep_high is not None and current_price < sweep_high else current_price
-        tp1 = _nearest_below(equal_lows, entry) or _nearest_below(swing_lows, entry)
-        sl = (sweep_high + buffer) if sweep_high is not None else _fallback_sl(entry, direction)
-        sl, risk = _normalize_sl(entry, sl, direction)
-        if tp1 is None:
-            tp1, tp2 = _fallback_tp(entry, sl, direction)
-            tp_reason = "fallback_rr_target"
-            analysis.update({"fallback_tp": True})
-        else:
-            tp2 = _nearest_below(equal_lows + swing_lows, tp1) or (tp1 - abs(entry - tp1))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
-        sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"sweep_high": round(sweep_high, 2) if sweep_high is not None else None, "target_liquidity": round(tp1, 2)})
+        analysis.update({"sweep_high": round(sweep_high, 2) if sweep_high is not None else None})
         pattern_name = logic_key
     elif logic_key == "CONTINUATION_LONG":
         pullback_low = _nearest_below(swing_lows + equal_lows, current_price)
-        tp1 = _nearest_above(swing_highs, current_price) or _nearest_above(equal_highs, current_price)
         entry = current_price
-        sl = (pullback_low - buffer) if pullback_low is not None else _fallback_sl(entry, direction)
-        sl, risk = _normalize_sl(entry, sl, direction)
-        if tp1 is None:
-            tp1, tp2 = _fallback_tp(entry, sl, direction)
-            tp_reason = "fallback_rr_target"
-            analysis.update({"fallback_tp": True})
-        else:
-            tp2 = _nearest_above(swing_highs + equal_highs, tp1) or (tp1 + abs(tp1 - entry))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
-        sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"pullback_low": round(pullback_low, 2) if pullback_low is not None else None, "trend_target": round(tp1, 2)})
+        analysis.update({"pullback_low": round(pullback_low, 2) if pullback_low is not None else None})
         pattern_name = logic_key
     elif logic_key == "CONTINUATION_SHORT":
         pullback_high = _nearest_above(swing_highs + equal_highs, current_price)
-        tp1 = _nearest_below(swing_lows, current_price) or _nearest_below(equal_lows, current_price)
         entry = current_price
-        sl = (pullback_high + buffer) if pullback_high is not None else _fallback_sl(entry, direction)
-        sl, risk = _normalize_sl(entry, sl, direction)
-        if tp1 is None:
-            tp1, tp2 = _fallback_tp(entry, sl, direction)
-            tp_reason = "fallback_rr_target"
-            analysis.update({"fallback_tp": True})
-        else:
-            tp2 = _nearest_below(swing_lows + equal_lows, tp1) or (tp1 - abs(entry - tp1))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
-        sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"pullback_high": round(pullback_high, 2) if pullback_high is not None else None, "trend_target": round(tp1, 2)})
+        analysis.update({"pullback_high": round(pullback_high, 2) if pullback_high is not None else None})
         pattern_name = logic_key
     elif logic_key == "ABSORPTION_REVERSAL_LONG":
         absorption_low = _nearest_below(equal_lows + swing_lows, current_price)
+        buffer = current_price * SL_BUFFER_PCT
         entry = absorption_low + (buffer * 2) if absorption_low is not None and current_price > absorption_low else current_price
-        tp1 = _nearest_above(equal_highs + swing_highs, entry)
-        sl = (absorption_low - buffer) if absorption_low is not None else _fallback_sl(entry, direction)
-        sl, risk = _normalize_sl(entry, sl, direction)
-        if tp1 is None:
-            tp1, tp2 = _fallback_tp(entry, sl, direction)
-            tp_reason = "fallback_rr_target"
-            analysis.update({"fallback_tp": True})
-        else:
-            tp2 = _nearest_above(equal_highs + swing_highs, tp1) or (tp1 + abs(tp1 - entry))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
-        sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"absorption_low": round(absorption_low, 2) if absorption_low is not None else None, "resistance_target": round(tp1, 2)})
+        analysis.update({"absorption_low": round(absorption_low, 2) if absorption_low is not None else None})
         pattern_name = logic_key
     elif logic_key == "ABSORPTION_REVERSAL_SHORT":
         absorption_high = _nearest_above(equal_highs + swing_highs, current_price)
+        buffer = current_price * SL_BUFFER_PCT
         entry = absorption_high - (buffer * 2) if absorption_high is not None and current_price < absorption_high else current_price
-        tp1 = _nearest_below(equal_lows + swing_lows, entry)
-        sl = (absorption_high + buffer) if absorption_high is not None else _fallback_sl(entry, direction)
-        sl, risk = _normalize_sl(entry, sl, direction)
-        if tp1 is None:
-            tp1, tp2 = _fallback_tp(entry, sl, direction)
-            tp_reason = "fallback_rr_target"
-            analysis.update({"fallback_tp": True})
-        else:
-            tp2 = _nearest_below(equal_lows + swing_lows, tp1) or (tp1 - abs(entry - tp1))
         entry_reason = ENTRY_LOGIC[logic_key]["entry_reason"]
-        sl_reason = ENTRY_LOGIC[logic_key]["sl_reason"]
-        tp_reason = tp_reason if tp_reason == "fallback_rr_target" else ENTRY_LOGIC[logic_key]["tp_reason"]
-        analysis.update({"absorption_high": round(absorption_high, 2) if absorption_high is not None else None, "support_target": round(tp1, 2)})
+        analysis.update({"absorption_high": round(absorption_high, 2) if absorption_high is not None else None})
         pattern_name = logic_key
     elif pattern_name in {"TRAP", "REVERSAL"}:
         entry = current_price
-        candle_low = _candle_extreme(candle_dna, "low")
-        candle_high = _candle_extreme(candle_dna, "high")
-        if direction == "LONG":
-            sl = candle_low - buffer if candle_low is not None else _fallback_sl(entry, direction)
-            tp1 = _nearest_above(equal_highs + swing_highs, entry)
-        else:
-            sl = candle_high + buffer if candle_high is not None else _fallback_sl(entry, direction)
-            tp1 = _nearest_below(equal_lows + swing_lows, entry)
-        sl, risk = _normalize_sl(entry, sl, direction)
-        if tp1 is None:
-            tp1, tp2 = _fallback_tp(entry, sl, direction)
-            tp_reason = "fallback_rr_target"
-            analysis.update({"fallback_tp": True})
-        else:
-            tp2 = (
-                _nearest_above(equal_highs + swing_highs, tp1) or (tp1 + abs(tp1 - entry))
-                if direction == "LONG"
-                else _nearest_below(equal_lows + swing_lows, tp1) or (tp1 - abs(entry - tp1))
-            )
-        sl_reason = "candle_low_invalidation" if direction == "LONG" else "candle_high_invalidation"
         analysis.update({
-            "candle_low": round(candle_low, 2) if candle_low is not None else None,
-            "candle_high": round(candle_high, 2) if candle_high is not None else None,
-            "target_liquidity": round(tp1, 2),
+            "candle_low": round(_candle_extreme(candle_dna, "low"), 2) if _candle_extreme(candle_dna, "low") is not None else None,
+            "candle_high": round(_candle_extreme(candle_dna, "high"), 2) if _candle_extreme(candle_dna, "high") is not None else None,
         })
     else:
         geometry = _build_generic_geometry(pattern_name, direction, timeframe, current_price, zone_list, pattern_reason, candle_dna)
@@ -402,17 +477,42 @@ def _compute_geometry(
         geometry["confidence"] = round(confidence, 4)
         return geometry
 
-    if entry is None or sl is None or tp1 is None or tp2 is None:
+    if entry is None:
         return None
 
-    reward = abs(tp1 - entry)
-    if risk <= 0 or reward <= 0:
+    sl, risk, sl_reason, sl_analysis = _resolve_structural_sl(entry, direction, swing_highs, swing_lows, candle_dna)
+    analysis.update(sl_analysis)
+    tp_result = _resolve_tp(entry, sl, direction, equal_highs, equal_lows, swing_highs, swing_lows)
+    if tp_result is None:
+        logger.info("Geometry skipped: %s %s RR remained below %.2f", pattern_name, direction, MIN_ACCEPTABLE_RR)
         return None
+    tp1, tp_reason, rr, tp_analysis = tp_result
+    analysis.update(tp_analysis)
+    tp2_fallback, _ = _fallback_tp_with_reason(entry, risk, direction)
+    if direction == "LONG":
+        tp2 = max(tp1, tp2_fallback)
+    else:
+        tp2 = min(tp1, tp2_fallback)
 
-    rr = reward / risk
+    if risk <= 0 or rr <= 0:
+        return None
+    if rr < MIN_ACCEPTABLE_RR:
+        return None
     if rr < config.MIN_RR:
         logger.info(f"Geometry skipped: RR={rr:.2f} < {config.MIN_RR}")
         return None
+
+    logger.info(
+        "Geometry: %s %s | entry=%.2f | sl=%.2f (%s) | tp1=%.2f (%s) | RR=%.2f",
+        pattern_name,
+        direction,
+        entry,
+        sl,
+        sl_reason,
+        tp1,
+        tp_reason,
+        rr,
+    )
 
     return {
         "timestamp_ms": int(time.time() * 1000),

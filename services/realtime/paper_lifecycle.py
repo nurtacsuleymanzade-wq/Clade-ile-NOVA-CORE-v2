@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 BOOK_TICKER_URL = f"{config.BINANCE_REST}/api/v3/ticker/bookTicker?symbol={config.SYMBOL}"
 TIMEOUT_SECONDS = config.TRADE_TIMEOUT_HOURS * 3600
 WIN_RESULTS = {"TP1_HIT", "TP2_HIT"}
+TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900}
 
 OPEN_TRADE_SCHEMA = [
     ("id", "TEXT PRIMARY KEY", "''"),
@@ -50,6 +51,7 @@ OPEN_TRADE_SCHEMA = [
     ("regime_at_entry", "TEXT", "''"),
     ("opened_at", "TEXT", "''"),
     ("opened_at_epoch", "INTEGER", "0"),
+    ("lineage_chain", "TEXT", "''"),
     ("context_json", "TEXT", "'{}'"),
 ]
 
@@ -119,6 +121,7 @@ def _default_close_reason(result: str) -> str:
         "TP1_HIT": "tp1_target_hit",
         "TP2_HIT": "tp2_target_hit",
         "TIMEOUT": "timeout_no_target_hit",
+        "THESIS_BROKEN": "thesis_broken",
     }
     return mapping.get(result, result.lower() if result else "")
 
@@ -208,6 +211,7 @@ def _normalize_open_trade(trade: dict) -> dict:
         "regime_at_entry": str(trade.get("regime_at_entry", "")),
         "opened_at": opened_at_text,
         "opened_at_epoch": opened_at_epoch,
+        "lineage_chain": str(trade.get("lineage_chain", "")),
         "context_json": context_json,
     }
 
@@ -313,6 +317,46 @@ def _append_closed_trade(closed_trade: dict) -> None:
         f.write(line)
 
 
+def _decision_candle_timestamp(decision: dict) -> int:
+    return _coerce_int(
+        decision.get("candle_timestamp")
+        or decision.get("timestamp_ms")
+        or decision.get("opened_at_epoch")
+    )
+
+
+def _build_duplicate_key(candle_timestamp: int, pattern: str, direction: str, timeframe: str) -> str:
+    return f"{candle_timestamp}|{pattern}|{direction}|{timeframe}"
+
+
+def _extract_context(trade: dict) -> dict:
+    context = trade.get("context_json")
+    if isinstance(context, dict):
+        return context
+    if isinstance(context, str) and context:
+        try:
+            parsed = json.loads(context)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _check_thesis_broken(trade: dict, current_candle_dna: dict | None) -> bool:
+    if not isinstance(current_candle_dna, dict):
+        return False
+
+    direction = str(trade.get("direction", ""))
+    cvd = _coerce_float(current_candle_dna.get("cvd", 0))
+    body_ratio = _coerce_float(current_candle_dna.get("body_ratio", 0))
+
+    if "LONG" in direction and cvd < -0.5 and body_ratio > 0.6:
+        return True
+    if "SHORT" in direction and cvd > 0.5 and body_ratio > 0.6:
+        return True
+    return False
+
+
 async def _fetch_price(session: aiohttp.ClientSession) -> float | None:
     try:
         async with session.get(BOOK_TICKER_URL, timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -339,14 +383,56 @@ class PaperLifecycle:
             return False
         return True
 
+    def _check_duplicate_or_cooldown(self, decision: dict, open_trades: list[dict]) -> str | None:
+        pattern = str(decision.get("pattern", ""))
+        direction = str(decision.get("direction", ""))
+        timeframe = str(decision.get("timeframe", "1m"))
+        candle_timestamp = _decision_candle_timestamp(decision)
+        duplicate_key = _build_duplicate_key(candle_timestamp, pattern, direction, timeframe)
+        cooldown_window = TIMEFRAME_SECONDS.get(timeframe, 60) * 1000
+        now_ms = int(time.time() * 1000)
+
+        for trade in open_trades:
+            trade_context = _extract_context(trade)
+            trade_candle_timestamp = _coerce_int(
+                trade.get("candle_timestamp") or trade_context.get("candle_timestamp") or trade.get("opened_at_epoch")
+            )
+            trade_key = _build_duplicate_key(
+                trade_candle_timestamp,
+                str(trade.get("pattern", "")),
+                str(trade.get("direction", "")),
+                str(trade.get("timeframe", "1m")),
+            )
+            if trade_key == duplicate_key:
+                return "DUPLICATE_SAME_CANDLE"
+
+        matching_trades = [
+            trade for trade in open_trades
+            if str(trade.get("pattern", "")) == pattern
+            and str(trade.get("direction", "")) == direction
+            and str(trade.get("timeframe", "1m")) == timeframe
+        ]
+        if matching_trades:
+            last_opened_epoch = max(_coerce_int(trade.get("opened_at_epoch")) for trade in matching_trades)
+            elapsed = now_ms - last_opened_epoch
+            if elapsed < cooldown_window:
+                return "COOLDOWN_ACTIVE"
+
+        return None
+
     def _open_trade(self, decision: dict, open_trades: list[dict]) -> dict | None:
         direction = decision.get("direction", "NEUTRAL")
         pattern = decision.get("pattern", "NONE")
         if not self._can_open(direction, pattern, open_trades):
             logger.info(f"Trade limit reached for {pattern} {direction}")
             return None
+        rejection_reason = self._check_duplicate_or_cooldown(decision, open_trades)
+        if rejection_reason:
+            logger.info("Trade skipped for %s %s: reason_code=%s", pattern, direction, rejection_reason)
+            return None
 
         now_ms = int(time.time() * 1000)
+        candle_timestamp = _decision_candle_timestamp(decision)
         trade_id = str(uuid.uuid4())[:8]
         context = {
             "tags": decision.get("tags", []),
@@ -354,6 +440,7 @@ class PaperLifecycle:
             "trend_reason": decision.get("trend_reason", ""),
             "regime_reason": decision.get("regime_reason", ""),
             "lineage_chain": decision.get("lineage_chain", ""),
+            "candle_timestamp": candle_timestamp,
         }
         trade = _normalize_open_trade({
             "id": trade_id,
@@ -382,6 +469,7 @@ class PaperLifecycle:
             "regime_at_entry": decision.get("regime_at_entry", ""),
             "opened_at": _utc_iso_from_ms(now_ms),
             "opened_at_epoch": now_ms,
+            "lineage_chain": decision.get("lineage_chain", ""),
             "context_json": context,
         })
         _insert_open_trade(config.PAPER_TRADES_DB, trade)
@@ -396,7 +484,12 @@ class PaperLifecycle:
         )
         return trade
 
-    def _check_exits(self, trades: list[dict], price: float) -> list[tuple[str, str, float, float, str]]:
+    def _check_exits(
+        self,
+        trades: list[dict],
+        price: float,
+        current_candle_dna: dict | None = None,
+    ) -> list[tuple[str, str, float, float, str]]:
         exits: list[tuple[str, str, float, float, str]] = []
         now_ms = int(time.time() * 1000)
         for trade in trades:
@@ -413,6 +506,11 @@ class PaperLifecycle:
             if (now_ms - opened_at_epoch) >= TIMEOUT_SECONDS * 1000:
                 r_multiple = (price - entry) / risk if direction == "LONG" else (entry - price) / risk
                 exits.append((trade["id"], "TIMEOUT", round(r_multiple, 4), round(price, 2), "timeout_no_target_hit"))
+                continue
+
+            if _check_thesis_broken(trade, current_candle_dna):
+                r_multiple = (price - entry) / risk if direction == "LONG" else (entry - price) / risk
+                exits.append((trade["id"], "THESIS_BROKEN", round(r_multiple, 4), round(price, 2), "thesis_broken"))
                 continue
 
             if direction == "LONG":
@@ -443,6 +541,7 @@ class PaperLifecycle:
             while True:
                 try:
                     decision = _load_json(config.DECISION_FILE) or {}
+                    current_candle_dna = _load_json(config.CANDLE_DNA_STATE_FILE) or {}
                     price = await _fetch_price(session)
                     open_trades = _get_open_trades(config.PAPER_TRADES_DB)
 
@@ -456,7 +555,7 @@ class PaperLifecycle:
                         open_trades = _get_open_trades(config.PAPER_TRADES_DB)
 
                     if price is not None:
-                        exits = self._check_exits(open_trades, price)
+                        exits = self._check_exits(open_trades, price, current_candle_dna)
                         for trade_id, result, r_multiple, exit_price, close_reason in exits:
                             now_ms = int(time.time() * 1000)
                             closed_trade = _close_trade_in_db(
