@@ -52,6 +52,10 @@ OPEN_TRADE_SCHEMA = [
     ("regime_at_entry", "TEXT", "''"),
     ("opened_at", "TEXT", "''"),
     ("opened_at_epoch", "INTEGER", "0"),
+    ("min_exit_delay_seconds", "INTEGER", "30"),
+    ("exit_armed_at", "INTEGER", "0"),
+    ("mae", "REAL", "0"),
+    ("mfe", "REAL", "0"),
     ("lineage_chain", "TEXT", "''"),
     ("context_json", "TEXT", "'{}'"),
 ]
@@ -166,6 +170,20 @@ def _init_db(db_path: Path) -> None:
 
     _ensure_columns(cur, "open_trades", OPEN_TRADE_SCHEMA)
     _ensure_columns(cur, "closed_trades", OPEN_TRADE_SCHEMA + CLOSED_EXTRA_SCHEMA)
+    cur.execute(
+        """
+        UPDATE open_trades
+        SET exit_armed_at = opened_at_epoch + (COALESCE(min_exit_delay_seconds, 30) * 1000)
+        WHERE COALESCE(exit_armed_at, 0) <= 0 AND COALESCE(opened_at_epoch, 0) > 0
+        """
+    )
+    cur.execute(
+        """
+        UPDATE closed_trades
+        SET exit_armed_at = opened_at_epoch + (COALESCE(min_exit_delay_seconds, 30) * 1000)
+        WHERE COALESCE(exit_armed_at, 0) <= 0 AND COALESCE(opened_at_epoch, 0) > 0
+        """
+    )
 
     conn.commit()
     conn.close()
@@ -177,6 +195,10 @@ def _normalize_open_trade(trade: dict) -> dict:
         opened_at_epoch = _ms_from_utc_iso(trade.get("opened_at"))
     if opened_at_epoch <= 0:
         opened_at_epoch = int(time.time() * 1000)
+    min_exit_delay_seconds = _coerce_int(trade.get("min_exit_delay_seconds"), 30)
+    exit_armed_at = _coerce_int(trade.get("exit_armed_at"))
+    if exit_armed_at <= 0:
+        exit_armed_at = opened_at_epoch + (min_exit_delay_seconds * 1000)
 
     opened_at_text = trade.get("opened_at") or _utc_iso_from_ms(opened_at_epoch)
     context_json = trade.get("context_json")
@@ -212,6 +234,10 @@ def _normalize_open_trade(trade: dict) -> dict:
         "regime_at_entry": str(trade.get("regime_at_entry", "")),
         "opened_at": opened_at_text,
         "opened_at_epoch": opened_at_epoch,
+        "min_exit_delay_seconds": min_exit_delay_seconds,
+        "exit_armed_at": exit_armed_at,
+        "mae": max(0.0, _coerce_float(trade.get("mae"))),
+        "mfe": max(0.0, _coerce_float(trade.get("mfe"))),
         "lineage_chain": str(trade.get("lineage_chain", "")),
         "context_json": context_json,
     }
@@ -316,6 +342,34 @@ def _append_closed_trade(closed_trade: dict) -> None:
     line = json.dumps(closed_trade, ensure_ascii=False) + "\n"
     with open(config.CLOSED_TRADES_FILE, "a", encoding="utf-8") as f:
         f.write(line)
+
+
+def _update_open_trade_mae_mfe(db_path: Path, trade_id: str, mae: float, mfe: float) -> None:
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE open_trades SET mae=?, mfe=? WHERE id=?",
+        (round(max(0.0, mae), 8), round(max(0.0, mfe), 8), trade_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _refresh_trade_excursions(db_path: Path, trades: list[dict], current_price: float) -> None:
+    for trade in trades:
+        entry = _coerce_float(trade.get("entry"))
+        if entry <= 0:
+            continue
+        direction = str(trade.get("direction", ""))
+        current_mae = max(0.0, _coerce_float(trade.get("mae")))
+        current_mfe = max(0.0, _coerce_float(trade.get("mfe")))
+        if direction == "LONG":
+            mae = max(current_mae, entry - current_price)
+            mfe = max(current_mfe, current_price - entry)
+        else:
+            mae = max(current_mae, current_price - entry)
+            mfe = max(current_mfe, entry - current_price)
+        _update_open_trade_mae_mfe(db_path, str(trade.get("id", "")), mae, mfe)
 
 
 def _decision_candle_timestamp(decision: dict) -> int:
@@ -447,6 +501,10 @@ class PaperLifecycle:
             "regime_at_entry": decision.get("regime_at_entry", ""),
             "opened_at": _utc_iso_from_ms(now_ms),
             "opened_at_epoch": now_ms,
+            "min_exit_delay_seconds": decision.get("min_exit_delay_seconds", 30),
+            "exit_armed_at": now_ms + (_coerce_int(decision.get("min_exit_delay_seconds"), 30) * 1000),
+            "mae": 0.0,
+            "mfe": 0.0,
             "lineage_chain": decision.get("lineage_chain", ""),
             "context_json": context,
         })
@@ -469,7 +527,7 @@ class PaperLifecycle:
         current_candle_dna: dict | None = None,
     ) -> list[tuple[str, str, float, float, str]]:
         exits: list[tuple[str, str, float, float, str]] = []
-        current_epoch = int(time.time() * 1000)
+        current_ms = int(time.time() * 1000)
         for trade in trades:
             direction = trade["direction"]
             entry = _coerce_float(trade["entry"])
@@ -479,11 +537,17 @@ class PaperLifecycle:
             opened_at_epoch = _coerce_int(trade.get("opened_at_epoch"))
             if opened_at_epoch <= 0:
                 opened_at_epoch = _ms_from_utc_iso(trade.get("opened_at"))
+            exit_armed_at = _coerce_int(trade.get("exit_armed_at"))
+            if exit_armed_at <= 0:
+                exit_armed_at = opened_at_epoch + (_coerce_int(trade.get("min_exit_delay_seconds"), 30) * 1000)
             risk = abs(entry - sl) or 1e-9
-            elapsed_since_open_ms = current_epoch - opened_at_epoch
+            elapsed_since_open_ms = current_ms - opened_at_epoch
 
             # Only evaluate price-based exits on data that arrives after the trade opens.
-            if opened_at_epoch >= current_epoch or elapsed_since_open_ms < MIN_EXIT_CHECK_DELAY_MS:
+            if opened_at_epoch >= current_ms or elapsed_since_open_ms < MIN_EXIT_CHECK_DELAY_MS:
+                continue
+
+            if current_ms < exit_armed_at:
                 continue
 
             if elapsed_since_open_ms >= TIMEOUT_SECONDS * 1000:
@@ -538,6 +602,8 @@ class PaperLifecycle:
                         open_trades = _get_open_trades(config.PAPER_TRADES_DB)
 
                     if price is not None:
+                        _refresh_trade_excursions(config.PAPER_TRADES_DB, open_trades, price)
+                        open_trades = _get_open_trades(config.PAPER_TRADES_DB)
                         exits = self._check_exits(open_trades, price, current_candle_dna)
                         for trade_id, result, r_multiple, exit_price, close_reason in exits:
                             now_ms = int(time.time() * 1000)

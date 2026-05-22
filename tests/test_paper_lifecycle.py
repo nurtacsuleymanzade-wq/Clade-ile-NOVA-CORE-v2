@@ -107,6 +107,10 @@ def test_trade_dna_schema_columns_exist():
             "trend_at_entry",
             "regime_at_entry",
             "opened_at",
+            "min_exit_delay_seconds",
+            "exit_armed_at",
+            "mae",
+            "mfe",
             "lineage_chain",
         ):
             assert required in open_columns
@@ -132,6 +136,7 @@ def test_closes_on_sl_hit():
                 "tp1": 50300.0,
                 "tp2": 50600.0,
                 "rr": 2.0,
+                "min_exit_delay_seconds": 0,
                 "opened_at": now_ms - 60000,
                 "context_json": "{}",
             }
@@ -174,6 +179,7 @@ def test_closes_on_tp1_hit():
                 "tp1": 50300.0,
                 "tp2": 50600.0,
                 "rr": 2.0,
+                "min_exit_delay_seconds": 0,
                 "opened_at": now_ms - 60000,
                 "context_json": "{}",
             }
@@ -206,6 +212,7 @@ def test_skips_exit_checks_in_first_second_after_open():
                 "tp1": 50300.0,
                 "tp2": 50600.0,
                 "rr": 2.0,
+                "min_exit_delay_seconds": 30,
                 "opened_at_epoch": opened_at_epoch,
                 "opened_at": opened_at_epoch,
                 "context_json": "{}",
@@ -236,6 +243,7 @@ def test_allows_exit_checks_after_one_second_has_elapsed():
                 "tp1": 50300.0,
                 "tp2": 50600.0,
                 "rr": 2.0,
+                "min_exit_delay_seconds": 0,
                 "opened_at_epoch": opened_at_epoch,
                 "opened_at": opened_at_epoch,
                 "context_json": "{}",
@@ -364,6 +372,7 @@ def test_open_trade_persists_trade_dna_fields():
                 "session": "LONDON",
                 "trend_at_entry": "TREND_UP",
                 "regime_at_entry": "EXPANSION",
+                "min_exit_delay_seconds": 30,
                 "trend_reason": "swings high=4, low=3",
                 "regime_reason": "atr=10, delta_consistency=0.8",
                 "lineage_chain": "4.20 -> PRESSURE_BUILDING_LONG -> STOP_HUNT_RECLAIM_LONG -> reclaim_after_sweep_low",
@@ -377,7 +386,119 @@ def test_open_trade_persists_trade_dna_fields():
             assert open_trade["sl_reason"] == "below_sweep_low_invalidation"
             assert open_trade["tp_reason"] == "nearest_equal_high_liquidity"
             assert open_trade["context_adjusted_confidence"] == 0.84
+            assert open_trade["min_exit_delay_seconds"] == 30
+            assert open_trade["exit_armed_at"] - open_trade["opened_at_epoch"] == 30000
+            assert open_trade["mae"] == 0.0
+            assert open_trade["mfe"] == 0.0
             assert open_trade["lineage_chain"] == decision["lineage_chain"]
+
+
+def test_exit_waits_until_trade_is_armed():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import PaperLifecycle
+
+            opened_at_epoch = 1_700_000_000_000
+            trade = {
+                "id": "armed01",
+                "pattern": "TRAP",
+                "direction": "LONG",
+                "entry": 50000.0,
+                "sl": 49850.0,
+                "tp1": 50300.0,
+                "tp2": 50600.0,
+                "rr": 2.0,
+                "opened_at_epoch": opened_at_epoch,
+                "opened_at": opened_at_epoch,
+                "min_exit_delay_seconds": 30,
+                "exit_armed_at": opened_at_epoch + 30000,
+                "context_json": "{}",
+            }
+
+            pl = PaperLifecycle.__new__(PaperLifecycle)
+            pl._last_decision_ts = 0
+
+            with patch("services.realtime.paper_lifecycle.time.time", return_value=(opened_at_epoch + 5000) / 1000):
+                exits = pl._check_exits([trade], 49800.0)
+
+            assert exits == []
+
+
+def test_refresh_trade_excursions_updates_and_persists_mae_mfe():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import _get_open_trades, _insert_open_trade, _refresh_trade_excursions
+
+            now_ms = int(time.time() * 1000) - 60000
+            long_trade = {
+                "id": "mae01",
+                "pattern": "TRAP",
+                "direction": "LONG",
+                "entry": 100.0,
+                "sl": 95.0,
+                "tp1": 110.0,
+                "tp2": 115.0,
+                "min_exit_delay_seconds": 0,
+                "opened_at_epoch": now_ms,
+                "opened_at": now_ms,
+                "context_json": "{}",
+            }
+            short_trade = {
+                "id": "mfe01",
+                "pattern": "TRAP",
+                "direction": "SHORT",
+                "entry": 100.0,
+                "sl": 105.0,
+                "tp1": 90.0,
+                "tp2": 85.0,
+                "min_exit_delay_seconds": 0,
+                "opened_at_epoch": now_ms,
+                "opened_at": now_ms,
+                "context_json": "{}",
+            }
+            _insert_open_trade(db_path, long_trade)
+            _insert_open_trade(db_path, short_trade)
+
+            _refresh_trade_excursions(db_path, _get_open_trades(db_path), 97.0)
+            _refresh_trade_excursions(db_path, _get_open_trades(db_path), 92.0)
+
+            trades = {trade["id"]: trade for trade in _get_open_trades(db_path)}
+            assert trades["mae01"]["mae"] == 8.0
+            assert trades["mae01"]["mfe"] == 0.0
+            assert trades["mfe01"]["mae"] == 0.0
+            assert trades["mfe01"]["mfe"] == 8.0
+
+
+def test_close_trade_carries_mae_mfe_into_closed_trades():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _setup_temp_db(tmp)
+        with patch.object(config, "PAPER_TRADES_DB", db_path):
+            from services.realtime.paper_lifecycle import _close_trade_in_db, _insert_open_trade
+
+            now_ms = int(time.time() * 1000) - 60000
+            trade = {
+                "id": "close01",
+                "pattern": "TRAP",
+                "direction": "LONG",
+                "entry": 100.0,
+                "sl": 95.0,
+                "tp1": 110.0,
+                "tp2": 115.0,
+                "min_exit_delay_seconds": 0,
+                "mae": 4.0,
+                "mfe": 7.5,
+                "opened_at_epoch": now_ms,
+                "opened_at": now_ms,
+                "context_json": "{}",
+            }
+            _insert_open_trade(db_path, trade)
+            closed_trade = _close_trade_in_db(db_path, "close01", "TP1_HIT", 2.0, 110.0, now_ms + 30000, "tp1_target_hit")
+
+            assert closed_trade is not None
+            assert closed_trade["mae"] == 4.0
+            assert closed_trade["mfe"] == 7.5
 
 
 def test_blocks_duplicate_open_trade_same_pattern_direction_timeframe():

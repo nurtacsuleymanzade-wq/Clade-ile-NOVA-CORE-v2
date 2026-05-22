@@ -238,6 +238,21 @@ def _load_suppressed_state() -> dict:
     return _load_json(config.SUPPRESSED_FILE) or {}
 
 
+def _suppressed_combo_keys(suppressed_state: dict) -> set[str]:
+    suppressed_keys: set[str] = set()
+    for combo_key in suppressed_state.get("suppressed_combo_keys", []):
+        if combo_key:
+            suppressed_keys.add(str(combo_key))
+    for item in suppressed_state.get("suppressed", []):
+        combo_key = item.get("combo_key")
+        if combo_key:
+            suppressed_keys.add(str(combo_key))
+    for combo_key, item in (suppressed_state.get("combinations") or {}).items():
+        if item.get("status") == "SUPPRESSED" and combo_key:
+            suppressed_keys.add(str(combo_key))
+    return suppressed_keys
+
+
 def _find_suppressed_entry(
     suppressed_state: dict,
     combo_key: str,
@@ -326,7 +341,7 @@ def _make_decision(
     decision = _base_decision(now_ms, pattern, direction, confidence, context_adjusted_confidence)
 
     timeframe = str(geometry.get("timeframe", "1m"))
-    session = _utc_session(now_ms)
+    session = str(geometry.get("session") or _utc_session(now_ms))
     combo_key = f"{pattern}|{timeframe}|{session}|{trend_dir}"
     decision.update({
         "timeframe": timeframe,
@@ -355,6 +370,15 @@ def _make_decision(
         })
         return decision
 
+    suppressed_keys = _suppressed_combo_keys(suppressed_state)
+    if combo_key in suppressed_keys:
+        decision.update({
+            "decision": "BLOCKED",
+            "reason": "SUPPRESSED_COMBINATION",
+            "tags": ["suppressed"],
+        })
+        return decision
+
     if not used_pattern_fallback:
         suppressed_entry = _find_suppressed_entry(
             suppressed_state,
@@ -367,7 +391,7 @@ def _make_decision(
         if suppressed_entry:
             decision.update({
                 "decision": "BLOCKED",
-                "reason": "COMBINATION_SUPPRESSED",
+                "reason": "SUPPRESSED_COMBINATION",
                 "tags": ["suppressed"],
             })
             return decision

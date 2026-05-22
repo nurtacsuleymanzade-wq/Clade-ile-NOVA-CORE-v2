@@ -22,7 +22,7 @@ def test_blocks_low_context_confidence():
         "tp1": 50200.0,
         "tp2": 50400.0,
         "rr": 2.0,
-        "confidence": 0.45,
+        "confidence": 0.25,
         "pattern_reason": "wick_sweep_and_reclaim",
         "entry_reason": "reclaim_after_sweep_low",
         "sl_reason": "below_sweep_low_invalidation",
@@ -69,3 +69,37 @@ def test_decision_includes_trade_dna_fields_on_allow():
     assert decision["pattern_reason"] == "wick_sweep_and_reclaim"
     assert decision["entry_reason"] == "reclaim_after_sweep_low"
     assert decision["session"]
+
+
+def test_blocks_suppressed_combination_by_combo_key():
+    geometry = {
+        "pattern": "STOP_HUNT_RECLAIM_LONG",
+        "direction": "LONG",
+        "timeframe": "1m",
+        "session": "OFF_SESSION",
+        "entry": 50000.0,
+        "sl": 49850.0,
+        "tp1": 50300.0,
+        "tp2": 50600.0,
+        "rr": 2.0,
+        "confidence": 0.75,
+        "pattern_reason": "wick_sweep_and_reclaim",
+        "entry_reason": "reclaim_after_sweep_low",
+        "sl_reason": "below_sweep_low_invalidation",
+        "tp_reason": "nearest_equal_high_liquidity",
+    }
+    trend = {"trend": "TREND_DOWN", "swing_highs_count": 4, "swing_lows_count": 3}
+    regime = {"regime": "COMPRESSION", "atr": 12.0, "delta_consistency": 0.8}
+    suppressed_state = {
+        "suppressed_combo_keys": ["STOP_HUNT_RECLAIM_LONG|1m|OFF_SESSION|TREND_DOWN"],
+        "suppressed": [
+            {
+                "combo_key": "STOP_HUNT_RECLAIM_LONG|1m|OFF_SESSION|TREND_DOWN",
+                "status": "SUPPRESSED",
+            }
+        ],
+    }
+
+    decision = _make_decision(geometry, trend, regime, suppressed_state, {"score": 4.0}, {"event_type": "PRESSURE_BUILDING_LONG"}, {"cvd": 2.0, "body_ratio": 0.4})
+    assert decision["decision"] == "BLOCKED"
+    assert decision["reason"] == "SUPPRESSED_COMBINATION"
